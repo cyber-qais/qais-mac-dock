@@ -65,6 +65,12 @@ final class Store {
     var showRunning: Bool { get { bool("showRunning", true) } set { setBool("showRunning", newValue) } }
     var locked: Bool { get { bool("locked", true) } set { setBool("locked", newValue) } }
     var dockMode: Bool { get { bool("dockMode", true) } set { setBool("dockMode", newValue) } }
+    var hideSystemDock: Bool { get { bool("hideSystemDock", false) } set { setBool("hideSystemDock", newValue) } }
+    var restoreSystemDockOnQuit: Bool {
+        get { bool("restoreSystemDockOnQuit", true) }
+        set { setBool("restoreSystemDockOnQuit", newValue) }
+    }
+    var askedSystemDock: Bool { get { bool("askedSystemDock", false) } set { d.set(newValue, forKey: "askedSystemDock") } }
 
     private var placements: [String: Placement] {
         get { d.data(forKey: "placements").flatMap { try? JSONDecoder().decode([String: Placement].self, from: $0) } ?? [:] }
@@ -1677,6 +1683,55 @@ func registerAutoHideHotKey() {
     }, 1, &spec, nil, nil)
 }
 
+// MARK: - macOS Dock (hide / restore)
+
+/// Hides the built-in Dock by auto-hiding it with a very long reveal delay, so it never appears.
+/// It can't be quit: its process also runs ⌘-Tab, Mission Control and Spaces.
+enum SystemDock {
+    private static let domain = "com.apple.dock"
+    private static let savedKey = "systemDockSaved"
+
+    private static func run(_ path: String, _ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
+    }
+    private static func read(_ key: String) -> Any? { CFPreferencesCopyAppValue(key as CFString, domain as CFString) }
+
+    static var isHidden: Bool {
+        (read("autohide") as? Bool ?? false) && ((read("autohide-delay") as? NSNumber)?.doubleValue ?? 0) >= 999
+    }
+
+    static func hide() {
+        let d = UserDefaults.standard
+        if d.dictionary(forKey: savedKey) == nil && !isHidden {
+            var saved: [String: Any] = ["autohide": read("autohide") as? Bool ?? false]
+            if let delay = read("autohide-delay") as? NSNumber { saved["delay"] = delay.doubleValue }
+            d.set(saved, forKey: savedKey)
+        }
+        guard !isHidden else { return }
+        run("/usr/bin/defaults", ["write", domain, "autohide", "-bool", "true"])
+        run("/usr/bin/defaults", ["write", domain, "autohide-delay", "-float", "1000"])
+        run("/usr/bin/killall", ["Dock"])
+    }
+
+    /// Puts back the auto-hide settings saved before Q-Dock hid the Dock.
+    static func restore() {
+        let d = UserDefaults.standard
+        let saved = d.dictionary(forKey: savedKey) ?? ["autohide": false]
+        run("/usr/bin/defaults", ["write", domain, "autohide", "-bool", (saved["autohide"] as? Bool ?? false) ? "true" : "false"])
+        if let delay = saved["delay"] as? Double {
+            run("/usr/bin/defaults", ["write", domain, "autohide-delay", "-float", String(delay)])
+        } else {
+            run("/usr/bin/defaults", ["delete", domain, "autohide-delay"])
+        }
+        d.removeObject(forKey: savedKey)
+        run("/usr/bin/killall", ["Dock"])
+    }
+}
+
 // MARK: - Setup assistant
 
 func hasFullDiskAccess() -> Bool {
@@ -1741,7 +1796,9 @@ struct OnboardingView: View {
     @State private var loginItem = SMAppService.mainApp.status == .enabled
     @State private var imported = false
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-    private let steps = 3
+    @State private var hideDock = Store.shared.hideSystemDock
+    @State private var restoreOnQuit = Store.shared.restoreSystemDockOnQuit
+    private let steps = 4
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1749,6 +1806,7 @@ struct OnboardingView: View {
                 switch step {
                 case 0: welcome
                 case 1: permissions
+                case 2: systemDock
                 default: tips
                 }
             }
@@ -1837,6 +1895,31 @@ struct OnboardingView: View {
         }
     }
 
+    private var systemDock: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("The macOS Dock").font(.title.bold())
+            Text("Q-Dock can hide the built-in Dock so it stops jumping between screens and popping up over your work. ⌘-Tab, Mission Control and Spaces keep working. You can change this anytime from the menu.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 14) {
+                ChoiceCard(icon: "eye.slash", title: "Hide the macOS Dock", detail: "Use Q-Dock instead", selected: hideDock) {
+                    hideDock = true
+                    AppController.shared.setHideSystemDock(true)
+                }
+                ChoiceCard(icon: "eye", title: "Keep the macOS Dock", detail: "Use both docks", selected: !hideDock) {
+                    hideDock = false
+                    AppController.shared.setHideSystemDock(false)
+                }
+            }
+            Toggle("Bring the macOS Dock back when Q-Dock quits", isOn: Binding(get: { restoreOnQuit }, set: {
+                restoreOnQuit = $0
+                Store.shared.restoreSystemDockOnQuit = $0
+            }))
+            .disabled(!hideDock)
+        }
+        .onAppear { Store.shared.askedSystemDock = true }
+    }
+
     private var tips: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("The basics").font(.title.bold())
@@ -1873,6 +1956,27 @@ struct PermissionRow: View {
                 Button(buttonTitle, action: action)
             }
         }
+    }
+}
+
+struct ChoiceCard: View {
+    let icon: String, title: String, detail: String
+    let selected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: icon).font(.system(size: 28))
+                Text(title).font(.headline)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+            .background(RoundedRectangle(cornerRadius: 12).fill(selected ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: selected ? 2 : 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1938,7 +2042,46 @@ final class AppController: NSObject, NSApplicationDelegate {
         trashFull = trashIsFull()
         updateRunning()
         rebuild(animated: false)
+        if store.hideSystemDock { SystemDock.hide() }
         Onboarding.shared.showIfNeeded()
+        if UserDefaults.standard.bool(forKey: "onboarded") && !store.askedSystemDock {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.askAboutSystemDock() }
+        }
+        // `pkill`/logout send SIGTERM; route it through a normal quit so the macOS Dock gets restored.
+        signal(SIGTERM, SIG_IGN)
+        sigterm.setEventHandler { NSApp.terminate(nil) }
+        sigterm.resume()
+    }
+
+    private let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if store.hideSystemDock && store.restoreSystemDockOnQuit { SystemDock.restore() }
+    }
+
+    func setHideSystemDock(_ hide: Bool) {
+        store.askedSystemDock = true
+        guard hide != store.hideSystemDock || hide != SystemDock.isHidden else { return }
+        store.hideSystemDock = hide
+        if hide { SystemDock.hide() } else { SystemDock.restore() }
+    }
+
+    /// One-time question for people who finished setup before this option existed.
+    func askAboutSystemDock() {
+        store.askedSystemDock = true
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Hide the macOS Dock?"
+        a.informativeText = "Q-Dock can hide the built-in Dock so it stops jumping between screens and popping up over your work. "
+            + "⌘-Tab, Mission Control and Spaces keep working. You can change this anytime from the Q-Dock menu."
+        a.addButton(withTitle: "Hide macOS Dock")
+        a.addButton(withTitle: "Keep macOS Dock")
+        let box = NSButton(checkboxWithTitle: "Bring the macOS Dock back when Q-Dock quits", target: nil, action: nil)
+        box.state = store.restoreSystemDockOnQuit ? .on : .off
+        a.accessoryView = box
+        let hide = a.runModal() == .alertFirstButtonReturn
+        store.restoreSystemDockOnQuit = box.state == .on
+        setHideSystemDock(hide)
     }
 
     func updateRunning() {
@@ -2089,6 +2232,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         m.addItem(ActionItem("Dock Mode (keep windows out from behind)", checked: store.dockMode) { [weak self] in
             self?.toggleDockMode()
         })
+        m.addItem(ActionItem("Hide macOS Dock", checked: store.hideSystemDock) { [weak self] in
+            guard let self else { return }
+            self.setHideSystemDock(!self.store.hideSystemDock)
+        })
+        m.addItem(ActionItem("Bring Back macOS Dock When Q-Dock Quits", checked: store.restoreSystemDockOnQuit,
+                             enabled: store.hideSystemDock) { [weak self] in self?.store.restoreSystemDockOnQuit.toggle() })
         m.addItem(ActionItem("Keep Above Other Windows", checked: store.alwaysOnTop || store.dockMode, enabled: !store.dockMode) {
             [weak self] in self?.store.alwaysOnTop.toggle()
         })

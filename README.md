@@ -41,6 +41,7 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 🖥️ **Every screen** | A dock on each display. Each one can sit on a different edge, or they can all share one position. |
 | 📌 **Pin anywhere** | Snap to the left, right, top or bottom edge, or float it anywhere (vertical or horizontal). |
 | 🔒 **Lock Position** | Freeze it in place. The ⋮⋮ grip disappears until you unlock. |
+| 🙈 **Hide the macOS Dock** | Optional. Keeps the built-in Dock out of sight so only Q-Dock shows, and brings it back when Q-Dock quits if you want. |
 | 🫥 **Auto-Hide** | Per screen. The dock slides off its edge and comes back when you push the pointer against that edge. Toggle it with **⌃⌥D**. |
 | 🪟 **Dock Mode** | Keeps other windows out from behind an edge-pinned dock by nudging or resizing them. |
 | 🏷️ **Instant labels** | App names appear the moment you hover, with a small genie-style magnification. |
@@ -160,6 +161,21 @@ Right-click the dock → **Auto-Hide (this screen)**, or press **⌃⌥D** with 
 - It works on docks pinned to an edge. A floating dock doesn't auto-hide.
 - An auto-hidden dock doesn't reserve space in Dock Mode, so windows can use the whole screen.
 
+### Hiding the macOS Dock
+
+Q-Dock asks once (in the setup assistant) whether to hide the built-in Dock. You can change it anytime from the menu:
+**Hide macOS Dock** and **Bring Back macOS Dock When Q-Dock Quits**.
+
+The macOS Dock can't be quit, because the same process runs ⌘-Tab, Mission Control and Spaces. Instead, Q-Dock
+turns on its auto-hide with a very long delay, so it never appears. Your original Dock settings are saved and put
+back when you turn the option off (or when Q-Dock quits, if you chose that).
+
+To bring it back by hand:
+
+```bash
+defaults delete com.apple.dock autohide-delay; defaults write com.apple.dock autohide -bool false; killall Dock
+```
+
 ### Dock Mode
 
 Turn on **Dock Mode** to keep windows from sitting behind an edge-pinned dock. When a window overlaps the
@@ -185,6 +201,7 @@ The defaults are:
 | Icon Size | Small (32 pt) | Tiny 28 · Small 32 · Medium-Small 40 · Medium 48 · Medium-Large 56 · Large 64 · Huge 80 |
 | Icon Spacing | Tight (0) | Tight 0 · Compact 2 · Normal 6 · Roomy 12 |
 | Lock Position | On | |
+| Hide macOS Dock | Off (you're asked during setup) | Bring it back when Q-Dock quits: On |
 | Auto-Hide | Off | Per screen · ⌃⌥D toggles it on the screen under the pointer |
 | Dock Mode | On (once Accessibility is allowed) | |
 | Keep Above Other Windows | On | |
