@@ -2044,6 +2044,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         rebuild(animated: false)
         if store.hideSystemDock { SystemDock.hide() }
         Onboarding.shared.showIfNeeded()
+        if UserDefaults.standard.bool(forKey: "onboarded") && store.dockMode && !AXIsProcessTrusted() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, !AXIsProcessTrusted() else { return }
+                self.explainAccessibility()
+            }
+        }
         if UserDefaults.standard.bool(forKey: "onboarded") && !store.askedSystemDock {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.askAboutSystemDock() }
         }
@@ -2232,6 +2238,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         m.addItem(ActionItem("Dock Mode (keep windows out from behind)", checked: store.dockMode) { [weak self] in
             self?.toggleDockMode()
         })
+        if store.dockMode && !AXIsProcessTrusted() {
+            m.addItem(ActionItem("⚠️ Dock Mode needs Accessibility access — Fix…") { [weak self] in self?.explainAccessibility() })
+        }
         m.addItem(ActionItem("Hide macOS Dock", checked: store.hideSystemDock) { [weak self] in
             guard let self else { return }
             self.setHideSystemDock(!self.store.hideSystemDock)
@@ -2251,6 +2260,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         m.addItem(ActionItem("Setup Assistant…") { Onboarding.shared.show() })
         m.addItem(ActionItem("Quit Q-Dock", key: "q") { NSApp.terminate(nil) })
         return m
+    }
+
+    /// Accessibility grants are tied to the exact build; after an update macOS may silently drop it.
+    func explainAccessibility() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Dock Mode needs Accessibility access"
+        a.informativeText = "Dock Mode is on, but macOS isn't letting Q-Dock move other windows. This usually happens after "
+            + "Q-Dock is updated or rebuilt: the old permission no longer applies.\n\n"
+            + "In System Settings → Privacy & Security → Accessibility, select Q-Dock, click − to remove it, "
+            + "then click + and add Q-Dock from Applications again (or use the switch that appears)."
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Not Now")
+        if a.runModal() == .alertFirstButtonReturn {
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            openPrivacyPane("Privacy_Accessibility")
+        }
     }
 
     func toggleDockMode() {
