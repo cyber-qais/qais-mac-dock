@@ -8,7 +8,13 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 xcrun --sdk macosx swift tools/make-icon.swift assets/icon.png "$APP/Contents/Resources/AppIcon.icns"
-xcrun --sdk macosx swiftc -O -target "$(uname -m)-apple-macos14.0" main.swift -module-name QDock -o "$APP/Contents/MacOS/Q-Dock"
+# Universal binary (Apple Silicon + Intel)
+TMP=$(mktemp -d)
+for arch in arm64 x86_64; do
+  xcrun --sdk macosx swiftc -O -target "$arch-apple-macos14.0" main.swift -module-name QDock -o "$TMP/Q-Dock-$arch"
+done
+lipo -create "$TMP/Q-Dock-arm64" "$TMP/Q-Dock-x86_64" -output "$APP/Contents/MacOS/Q-Dock"
+rm -rf "$TMP"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

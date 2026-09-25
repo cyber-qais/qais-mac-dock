@@ -8,6 +8,14 @@
   A floating, pinnable dock for macOS — one on every screen, each positioned on its own.
 </p>
 
+<p align="center">
+  <a href="https://github.com/cyber-qais/qais-mac-dock/releases/latest"><b>⬇︎ Download the latest release</b></a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/dock-horizontal.png" alt="Q-Dock pinned horizontally, with pinned apps, folders, a separator, running apps and the Trash">
+</p>
+
 ---
 
 The macOS Dock lives on one edge of one screen. **Q-Dock** puts a dock on *every* display and lets you
@@ -29,6 +37,22 @@ pin each one to any edge, or float it anywhere. It's a single native Swift file 
 | 🧭 **Setup assistant** | A first-launch walkthrough for permissions and the basics. |
 
 ## Install
+
+### Download
+
+1. Download **Q-Dock.zip** from the [latest release](https://github.com/cyber-qais/qais-mac-dock/releases/latest) and unzip it.
+2. Move **Q-Dock.app** into your Applications folder.
+3. Open it. Q-Dock isn't notarized by Apple, so the first time you open it, **right-click → Open**, then click
+   **Open** again (or go to System Settings → Privacy & Security → **Open Anyway**). If macOS says the app is
+   "damaged", run:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Q-Dock.app
+   ```
+
+Runs on macOS 14 or later, on both Apple Silicon and Intel Macs.
+
+### Build from source
 
 Requires macOS 14 or later and Xcode (or the Xcode Command Line Tools).
 
@@ -58,6 +82,8 @@ pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applicat
 
 ### Move and pin it
 
+<img src="docs/screenshots/dock-vertical.png" align="right" height="420" alt="Q-Dock pinned vertically, wrapping onto a second column">
+
 - **Drag the ⋮⋮ grip** (or any empty spot on the dock).
   - Drop it **within ~60 pt of a screen edge** and it snaps to that edge.
   - Drop it **anywhere else** and it floats there.
@@ -66,6 +92,14 @@ pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applicat
 - **Each screen is independent.** Right-click the dock on a screen to move just that one. To keep
   them in sync, turn on **Same Position on Every Screen**.
 - Turn on **Lock Position** once it's where you want it.
+- If a dock gets too long for its edge, it wraps onto another row or column (right).
+
+<br clear="right">
+
+<p align="center">
+  <img src="docs/screenshots/hover-label.png" width="209" alt="Instant hover label over the Terminal icon">
+</p>
+<p align="center"><sub>App names appear the moment you hover.</sub></p>
 
 ### Add, arrange and remove
 
@@ -84,6 +118,12 @@ Click a docked folder to open it as a stack. Right-click the folder to pick how 
 
 - **Display As** → **Fan**, **Grid**, or **Folder** (open it in Finder)
 - **Sort By** → Name, Date Added, Date Modified, Date Created or Kind
+
+<p align="center">
+  <img src="docs/screenshots/folder-grid.png" width="327" alt="A folder opened as a Grid stack">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/file-context-menu.png" width="365" alt="Right-click menu on a file inside a stack">
+</p>
 
 Inside an open stack:
 
@@ -106,7 +146,13 @@ needs **Accessibility** permission.
 
 ## Settings
 
-Everything is in the right-click menu and the menu-bar icon. The defaults are:
+<img src="docs/screenshots/dock-menu.png" align="right" width="300" alt="Q-Dock's right-click menu">
+
+Everything is in the right-click menu (right) and the menu-bar icon.
+
+<br clear="right">
+
+The defaults are:
 
 | Setting | Default | Options |
 |---|---|---|
@@ -163,8 +209,10 @@ pkill -x Q-Dock; defaults delete com.local.qdock; open ~/Applications/Q-Dock.app
 | Full Disk Access | The Trash full/empty icon; opening protected folders as stacks | System Settings → Privacy & Security → Full Disk Access |
 | Automation (Finder) | **Empty Trash…** | macOS asks the first time you use it |
 
-The setup assistant (**Setup Assistant…** in the menu) shows live status for each permission and links to the
-right Settings page.
+The setup assistant opens on first launch, and you can reopen it anytime from **Setup Assistant…** in the menu.
+It shows live status for each permission and links to the right Settings page.
+
+![The three steps of the setup assistant: Welcome, Permissions and The basics](docs/screenshots/setup-assistant.png)
 
 ## Project layout
 
@@ -173,4 +221,5 @@ main.swift               the whole app (AppKit + a SwiftUI setup assistant)
 build.sh                 compiles, generates the icon, and bundles Q-Dock.app
 tools/make-icon.swift    turns assets/icon.png into AppIcon.icns
 assets/icon.png          app icon source
+docs/screenshots/        images used in this README
 ```
