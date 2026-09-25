@@ -36,5 +36,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+# Sign with the local "Q-Dock Local Signing" certificate if it exists (see tools/make-signing-cert.sh),
+# so macOS keeps permissions like Accessibility across rebuilds. Otherwise fall back to ad-hoc signing.
+IDENTITY=$(security find-identity -p codesigning 2>/dev/null | awk '/"Q-Dock Local Signing"/ {print $2; exit}')
+if [ -n "$IDENTITY" ]; then
+  codesign --force --sign "$IDENTITY" "$APP"
+  echo "Signed with Q-Dock Local Signing ($IDENTITY)"
+else
+  codesign --force --sign - "$APP"
+  echo "Signed ad-hoc (run tools/make-signing-cert.sh to keep permissions across rebuilds)"
+fi
 echo "Built $(pwd)/$APP"
