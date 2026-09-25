@@ -74,6 +74,7 @@ Requires macOS 14 or later and Xcode (or the Xcode Command Line Tools).
 ```bash
 git clone https://github.com/cyber-qais/qais-mac-dock.git
 cd qais-mac-dock
+tools/make-signing-cert.sh   # optional, once: keeps permissions across rebuilds
 ./build.sh
 cp -R Q-Dock.app ~/Applications/
 open ~/Applications/Q-Dock.app
@@ -90,8 +91,10 @@ pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applicat
 ```
 
 > [!NOTE]
-> The app is ad-hoc signed when you build it. After each rebuild, macOS treats it as a new app, so you
-> need to allow it again under **Accessibility** (and **Full Disk Access**, if you use it).
+> **Keep permissions across rebuilds:** run `tools/make-signing-cert.sh` once. It creates a self-signed
+> "Q-Dock Local Signing" certificate in your login keychain, and `build.sh` signs with it automatically.
+> Without it, builds are ad-hoc signed, and macOS treats every rebuild as a new app, so you'd have to allow
+> **Accessibility** (and **Full Disk Access**) again each time.
 
 ## Using Q-Dock
 
@@ -263,6 +266,7 @@ It shows live status for each permission and links to the right Settings page.
 main.swift               the whole app (AppKit + a SwiftUI setup assistant)
 build.sh                 compiles, generates the icon, and bundles Q-Dock.app
 tools/make-icon.swift    turns assets/icon.png into AppIcon.icns
+tools/make-signing-cert.sh  creates the local signing certificate build.sh uses
 assets/icon.png          app icon source
 docs/screenshots/        images used in this README
 ```
