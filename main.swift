@@ -1,4 +1,4 @@
-// PinDock — a floating, pinnable dock for macOS with a copy on every screen.
+// Q-Dock — a floating, pinnable dock for macOS with a copy on every screen.
 import AppKit
 import ApplicationServices
 import Combine
@@ -36,7 +36,7 @@ struct Placement: Codable, Equatable {
 
 final class Store {
     static let shared = Store()
-    static let changed = Notification.Name("PinDockStoreChanged")
+    static let changed = Notification.Name("QDockStoreChanged")
     private let d = UserDefaults.standard
 
     var items: [URL] {
@@ -282,7 +282,7 @@ final class IconView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    var displayName: String { kind == .trash ? "Trash" : PinDock.displayName(url) }
+    var displayName: String { kind == .trash ? "Trash" : QDock.displayName(url) }
     var runningApp: NSRunningApplication? {
         let p = canonicalPath(url)
         return NSWorkspace.shared.runningApplications.first { $0.bundleURL.map(canonicalPath) == p }
@@ -470,7 +470,7 @@ final class IconView: NSView {
             m.addItem(ActionItem("Remove from Dock") { Store.shared.remove(u) })
         }
         m.addItem(.separator())
-        m.addItem(submenuItem("PinDock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
+        m.addItem(submenuItem("Q-Dock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
         NSMenu.popUpContextMenu(m, with: e, for: self)
     }
 }
@@ -1646,7 +1646,7 @@ struct OnboardingView: View {
             Image(systemName: "dock.rectangle")
                 .font(.system(size: 64, weight: .light))
                 .foregroundStyle(Color.accentColor)
-            Text("Welcome to PinDock").font(.largeTitle.bold())
+            Text("Welcome to Q-Dock").font(.largeTitle.bold())
             Text("A dock you can pin to any edge of any screen — or float anywhere. Every display gets its own copy, positioned independently.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
@@ -1661,7 +1661,7 @@ struct OnboardingView: View {
             }
             .controlSize(.large)
             .disabled(imported)
-            Text("Optional — replaces PinDock's items with the apps and folders in your macOS Dock.")
+            Text("Optional — replaces Q-Dock's items with the apps and folders in your macOS Dock.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1670,7 +1670,7 @@ struct OnboardingView: View {
     private var permissions: some View {
         VStack(alignment: .leading, spacing: 20) {
             Text("Permissions").font(.title.bold())
-            Text("PinDock works without these, but a few features need them.").foregroundStyle(.secondary)
+            Text("Q-Dock works without these, but a few features need them.").foregroundStyle(.secondary)
             PermissionRow(icon: "macwindow.on.rectangle", title: "Accessibility",
                           detail: "Needed for Dock Mode, which moves other windows out from behind the dock.",
                           granted: axGranted, buttonTitle: "Grant Access") {
@@ -1678,7 +1678,7 @@ struct OnboardingView: View {
                 openPrivacyPane("Privacy_Accessibility")
             }
             PermissionRow(icon: "externaldrive", title: "Full Disk Access",
-                          detail: "Lets the Trash icon show when it's full, and lets folder stacks open protected folders. In Settings, click +, then choose PinDock from Applications.",
+                          detail: "Lets the Trash icon show when it's full, and lets folder stacks open protected folders. In Settings, click +, then choose Q-Dock from Applications.",
                           granted: fdaGranted, buttonTitle: "Open Settings") {
                 openPrivacyPane("Privacy_AllFiles")
             }
@@ -1686,7 +1686,7 @@ struct OnboardingView: View {
                 Image(systemName: "power").font(.title2).frame(width: 30)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Launch at Login").font(.headline)
-                    Text("Start PinDock automatically when you log in.").font(.callout).foregroundStyle(.secondary)
+                    Text("Start Q-Dock automatically when you log in.").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Toggle("", isOn: Binding(get: { loginItem }, set: { _ in
@@ -1705,7 +1705,7 @@ struct OnboardingView: View {
             TipRow(icon: "hand.draw", title: "Move it",
                    text: "Drag the ⋮⋮ grip (or any empty spot). Drop near an edge to pin, anywhere else to float. Lock Position hides the grip.")
             TipRow(icon: "cursorarrow.click.2", title: "Right-click for everything",
-                   text: "Icon size, spacing, position, Dock Mode, running apps, Trash — or use the PinDock icon in the menu bar.")
+                   text: "Icon size, spacing, position, Dock Mode, running apps, Trash — or use the Q-Dock icon in the menu bar.")
             TipRow(icon: "square.and.arrow.down.on.square", title: "Drag and drop",
                    text: "Drop apps or files onto the dock to add them, onto a folder to move them in, or onto the Trash to delete. Drag an icon off the dock to remove it.")
             TipRow(icon: "folder", title: "Folders",
@@ -1764,7 +1764,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = statusItem.button {
-            if let img = NSImage(systemSymbolName: "dock.rectangle", accessibilityDescription: "PinDock") {
+            if let img = NSImage(systemSymbolName: "dock.rectangle", accessibilityDescription: "Q-Dock") {
                 b.image = img
             } else {
                 b.title = "⌂"
@@ -1914,7 +1914,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         m.addItem(ActionItem("Launch at Login", checked: SMAppService.mainApp.status == .enabled) { self.toggleLoginItem() })
         m.addItem(.separator())
         m.addItem(ActionItem("Setup Assistant…") { Onboarding.shared.show() })
-        m.addItem(ActionItem("Quit PinDock", key: "q") { NSApp.terminate(nil) })
+        m.addItem(ActionItem("Quit Q-Dock", key: "q") { NSApp.terminate(nil) })
         return m
     }
 
@@ -1923,8 +1923,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "Dock Mode needs Accessibility access"
-            a.informativeText = "PinDock moves and resizes other apps' windows so they don't sit behind an edge-pinned dock. "
-                + "Allow PinDock in System Settings → Privacy & Security → Accessibility. Dock Mode starts working as soon as it's allowed."
+            a.informativeText = "Q-Dock moves and resizes other apps' windows so they don't sit behind an edge-pinned dock. "
+                + "Allow Q-Dock in System Settings → Privacy & Security → Accessibility. Dock Mode starts working as soon as it's allowed."
             a.runModal()
         }
         store.dockMode.toggle()
@@ -1958,12 +1958,23 @@ final class AppController: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "Couldn't change the login item"
-            a.informativeText = "\(error.localizedDescription)\n\nTip: move PinDock.app into your Applications folder first."
+            a.informativeText = "\(error.localizedDescription)\n\nTip: move Q-Dock.app into your Applications folder first."
             a.runModal()
         }
     }
 }
 
+/// One-time copy of settings from the app's previous identity (PinDock, com.local.pindock).
+func migrateLegacySettings() {
+    let d = UserDefaults.standard
+    guard d.object(forKey: "migratedFromPinDock") == nil else { return }
+    d.set(true, forKey: "migratedFromPinDock")
+    guard d.object(forKey: "items") == nil, d.object(forKey: "onboarded") == nil,
+          let old = d.persistentDomain(forName: "com.local.pindock") else { return }
+    for (k, v) in old where !k.hasPrefix("NS") { d.set(v, forKey: k) }
+}
+
+migrateLegacySettings()
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 app.delegate = AppController.shared

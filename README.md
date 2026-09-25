@@ -1,4 +1,4 @@
-# PinDock
+# Q-Dock
 
 A floating, pinnable dock for macOS, with a copy on every screen.
 
@@ -12,10 +12,10 @@ A floating, pinnable dock for macOS, with a copy on every screen.
 
 ```bash
 ./build.sh
-rm -rf ~/Applications/PinDock.app && cp -R PinDock.app ~/Applications/ && open ~/Applications/PinDock.app
+rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applications/ && open ~/Applications/Q-Dock.app
 ```
 
 Requires Xcode (uses `xcrun swiftc`), macOS 14+. The app is ad-hoc signed, so macOS asks for
 Accessibility permission (Dock Mode) again after each rebuild.
 
-Settings live in `defaults read com.local.pindock`.
+Settings live in `defaults read com.local.qdock`.
