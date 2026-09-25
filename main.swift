@@ -1738,8 +1738,12 @@ func hasFullDiskAccess() -> Bool {
     FileHandle(forReadingAtPath: "/Library/Application Support/com.apple.TCC/TCC.db") != nil
 }
 
+/// Opens a Privacy & Security page (e.g. "Privacy_Accessibility"), using the newer System Settings URL when available.
 func openPrivacyPane(_ anchor: String) {
-    if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") { NSWorkspace.shared.open(u) }
+    for base in ["x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+                 "x-apple.systempreferences:com.apple.preference.security"] {
+        if let u = URL(string: "\(base)?\(anchor)"), NSWorkspace.shared.open(u) { return }
+    }
 }
 
 /// Replaces the dock's items with the ones pinned in the macOS Dock (Finder first).
