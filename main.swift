@@ -42,10 +42,7 @@ final class Store {
     var items: [URL] {
         get {
             if let paths = d.stringArray(forKey: "items") { return paths.map { URL(fileURLWithPath: $0) } }
-            return ["/System/Library/CoreServices/Finder.app", "/Applications/Safari.app",
-                    "/System/Applications/Utilities/Terminal.app", "/System/Applications/System Settings.app"]
-                .filter { FileManager.default.fileExists(atPath: $0) }
-                .map { URL(fileURLWithPath: $0) }
+            return systemDockItems()
         }
         set { d.set(newValue.map(\.path), forKey: "items"); post() }
     }
@@ -53,11 +50,11 @@ final class Store {
     private func setBool(_ key: String, _ v: Bool) { d.set(v, forKey: key); post() }
 
     var iconSize: CGFloat {
-        get { let v = d.double(forKey: "iconSize"); return v > 0 ? v : 48 }
+        get { let v = d.double(forKey: "iconSize"); return v > 0 ? v : 32 }
         set { d.set(Double(newValue), forKey: "iconSize"); post() }
     }
     var spacing: CGFloat {
-        get { d.object(forKey: "spacing") as? Double ?? 6 }
+        get { d.object(forKey: "spacing") as? Double ?? 0 }
         set { d.set(Double(newValue), forKey: "spacing"); post() }
     }
     var allScreens: Bool { get { bool("allScreens", true) } set { setBool("allScreens", newValue) } }
@@ -65,8 +62,8 @@ final class Store {
     var alwaysOnTop: Bool { get { bool("alwaysOnTop", true) } set { setBool("alwaysOnTop", newValue) } }
     var showTrash: Bool { get { bool("showTrash", true) } set { setBool("showTrash", newValue) } }
     var showRunning: Bool { get { bool("showRunning", true) } set { setBool("showRunning", newValue) } }
-    var locked: Bool { get { bool("locked", false) } set { setBool("locked", newValue) } }
-    var dockMode: Bool { get { bool("dockMode", false) } set { setBool("dockMode", newValue) } }
+    var locked: Bool { get { bool("locked", true) } set { setBool("locked", newValue) } }
+    var dockMode: Bool { get { bool("dockMode", true) } set { setBool("dockMode", newValue) } }
 
     private var placements: [String: Placement] {
         get { d.data(forKey: "placements").flatMap { try? JSONDecoder().decode([String: Placement].self, from: $0) } ?? [:] }
@@ -74,7 +71,14 @@ final class Store {
     }
     func placement(for id: String) -> Placement {
         let p = placements
-        return syncPositions ? (p["*"] ?? Placement()) : (p[id] ?? p["*"] ?? Placement())
+        return syncPositions ? (p["*"] ?? defaultPlacement(for: nil)) : (p[id] ?? defaultPlacement(for: id))
+    }
+    /// Main screen: top edge, centered. Other screens: bottom edge, toward the right.
+    private func defaultPlacement(for id: String?) -> Placement {
+        if id == nil || id == NSScreen.screens.first?.stableID {
+            return Placement(edge: .top, fx: 0.5, fy: 1, vertical: false)
+        }
+        return Placement(edge: .bottom, fx: 0.88, fy: 0, vertical: false)
     }
     func setPlacement(_ pl: Placement, for ids: [String]) {
         var p = placements
@@ -1364,7 +1368,6 @@ final class DockMode {
             timer = nil
             return
         }
-        guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) else { return }
         if timer == nil {
             timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick(allApps: false) }
         }
@@ -1547,9 +1550,12 @@ func openPrivacyPane(_ anchor: String) {
 }
 
 /// Replaces the dock's items with the ones pinned in the macOS Dock (Finder first).
-func importSystemDock() {
-    guard let d = UserDefaults(suiteName: "com.apple.dock") else { return }
+func importSystemDock() { Store.shared.items = systemDockItems() }
+
+/// Apps and folders pinned in the macOS Dock, with Finder first.
+func systemDockItems() -> [URL] {
     var urls = [URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app")]
+    guard let d = UserDefaults(suiteName: "com.apple.dock") else { return urls }
     for key in ["persistent-apps", "persistent-others"] {
         for tile in d.array(forKey: key) as? [[String: Any]] ?? [] {
             let file = (tile["tile-data"] as? [String: Any])?["file-data"] as? [String: Any]
@@ -1558,7 +1564,7 @@ func importSystemDock() {
             }
         }
     }
-    Store.shared.items = urls
+    return urls
 }
 
 final class Onboarding {
