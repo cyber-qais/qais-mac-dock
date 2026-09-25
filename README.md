@@ -21,6 +21,19 @@
 The macOS Dock lives on one edge of one screen. **Q-Dock** puts a dock on *every* display and lets you
 pin each one to any edge, or float it anywhere. It's a single native Swift file with no dependencies.
 
+## Sound familiar?
+
+If you use more than one monitor, the macOS Dock probably gets in your way.
+
+| 😤 The macOS Dock… | ✅ Q-Dock… |
+|---|---|
+| **Jumps to another screen.** Nudge your pointer against the bottom of a different monitor and the Dock moves there, whether you meant it to or not. | **Stays where you put it.** Every screen has its own dock, and **Lock Position** keeps it from moving at all. |
+| **Only lives on one screen.** Your other monitors don't get a Dock, so you drag the pointer back across the desk to launch anything. | **Is on every screen.** Each display gets a full dock with all your apps, folders and the Trash. |
+| **Only goes on the bottom, left or right,** always centered. Never the top, and never where you'd actually like it. | **Goes anywhere.** Pin it to any edge (including the **top**), slide it along that edge, or float it anywhere, horizontally or vertically. |
+| **Has one position for every screen.** A layout that suits your laptop can't differ from the one on your ultrawide. | **Has a position per screen.** Top edge on one monitor, bottom on another, floating on a third. |
+| **Plays hide-and-seek with windows.** With auto-hide on, it pops up over whatever you're working on. Windows you've dragged or resized by hand end up tucked under it. | **Keeps windows out of the way.** Turn on **Dock Mode** and windows that slide under the dock get nudged or resized so they stay clear. |
+| **Shrinks your icons** as you pin more apps, until they're too small to tell apart. | **Wraps** onto another row or column instead, at the icon size and spacing you chose. |
+
 ## Features
 
 | | |
