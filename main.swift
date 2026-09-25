@@ -1,5 +1,6 @@
 // Q-Dock — a floating, pinnable dock for macOS with a copy on every screen.
 import AppKit
+import Carbon
 import ApplicationServices
 import Combine
 import QuickLookThumbnailing
@@ -80,6 +81,21 @@ final class Store {
         }
         return Placement(edge: .bottom, fx: 0.88, fy: 0, vertical: false)
     }
+    private var autoHideMap: [String: Bool] {
+        get { d.dictionary(forKey: "autoHide") as? [String: Bool] ?? [:] }
+        set { d.set(newValue, forKey: "autoHide") }
+    }
+    func autoHide(for id: String) -> Bool {
+        let m = autoHideMap
+        return syncPositions ? (m["*"] ?? false) : (m[id] ?? m["*"] ?? false)
+    }
+    func setAutoHide(_ v: Bool, for ids: [String]) {
+        var m = autoHideMap
+        if syncPositions { m["*"] = v } else { ids.forEach { m[$0] = v } }
+        autoHideMap = m
+        post()
+    }
+
     func setPlacement(_ pl: Placement, for ids: [String]) {
         var p = placements
         if syncPositions { p["*"] = pl } else { ids.forEach { p[$0] = pl } }
@@ -983,6 +999,7 @@ final class StackPanel: NSPanel {
 final class StackController: NSObject, NSWindowDelegate {
     static let shared = StackController()
     private var panel: StackPanel?
+    var isOpen: Bool { panel != nil }
     private var folder: URL?
     private var monitors: [Any] = []
     private var lastDismiss: (url: URL?, event: Int)?
@@ -1379,6 +1396,7 @@ final class DockMode {
     /// Strips of screen (Cocoa coordinates) that edge-pinned docks reserve.
     private func reserved() -> [(Edge, NSRect)] {
         AppController.shared.docks.values.compactMap { d in
+            guard !d.autoHide else { return nil }
             let f = d.panel.frame, s = d.screen.frame, g: CGFloat = 4
             switch Store.shared.placement(for: d.screenID).edge {
             case .left: return (.left, NSRect(x: s.minX, y: s.minY, width: f.maxX + g - s.minX, height: s.height))
@@ -1530,6 +1548,13 @@ final class Dock {
         let size = view.preferredSize
         view.frame = NSRect(origin: .zero, size: size)
         let f = frameFor(size: size, placement: p, in: vf)
+        shownFrame = f
+        if autoHide && hidden {
+            panel.setFrame(hiddenFrame, display: false)
+            return
+        }
+        hidden = false
+        panel.alphaValue = 1
         if animated && panel.isVisible {
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.2; panel.animator().setFrame(f, display: true) },
                                                  completionHandler: { [panel] in panel.invalidateShadow() })
@@ -1539,6 +1564,117 @@ final class Dock {
         }
         panel.orderFrontRegardless()
     }
+
+    // MARK: Auto-hide
+
+    private(set) var hidden = false
+    private var shownFrame = NSRect.zero
+    private var edgeSince: Date?
+    private var awaySince: Date?
+
+    /// Auto-hide applies only to docks pinned to an edge.
+    var autoHide: Bool {
+        Store.shared.autoHide(for: screenID) && Store.shared.placement(for: screenID).edge != .free
+    }
+
+    private var edge: Edge { Store.shared.placement(for: screenID).edge }
+
+    /// Just past the screen edge the dock is pinned to.
+    private var hiddenFrame: NSRect {
+        let f = shownFrame
+        switch edge {
+        case .left: return f.offsetBy(dx: -(f.width + kMargin), dy: 0)
+        case .right: return f.offsetBy(dx: f.width + kMargin, dy: 0)
+        case .top: return f.offsetBy(dx: 0, dy: f.height + kMargin)
+        default: return f.offsetBy(dx: 0, dy: -(f.height + kMargin))
+        }
+    }
+
+    /// Pointer is pressed against the dock's screen edge.
+    private func atEdge(_ m: NSPoint) -> Bool {
+        let s = screen.frame, t: CGFloat = 3
+        guard m.x >= s.minX - 1, m.x <= s.maxX + 1, m.y >= s.minY - 1, m.y <= s.maxY + 1 else { return false }
+        switch edge {
+        case .left: return m.x - s.minX <= t
+        case .right: return s.maxX - m.x <= t
+        case .top: return s.maxY - m.y <= t
+        case .bottom: return m.y - s.minY <= t
+        case .free: return false
+        }
+    }
+
+    func tickAutoHide(_ m: NSPoint) {
+        guard autoHide else {
+            if hidden { refresh(animated: false) }
+            return
+        }
+        let now = Date()
+        if hidden {
+            if atEdge(m) {
+                edgeSince = edgeSince ?? now
+                if now.timeIntervalSince(edgeSince!) >= 0.2 { reveal() }
+            } else {
+                edgeSince = nil
+            }
+            return
+        }
+        let busy = StackController.shared.isOpen || AppController.shared.menuDepth > 0 || NSEvent.pressedMouseButtons != 0
+        let near = shownFrame.insetBy(dx: -24, dy: -24).contains(m) || atEdge(m)
+        if busy || near {
+            awaySince = nil
+        } else {
+            awaySince = awaySince ?? now
+            if now.timeIntervalSince(awaySince!) >= 0.5 { conceal() }
+        }
+    }
+
+    private func conceal() {
+        hidden = true
+        awaySince = nil
+        HoverLabel.shared.hide()
+        let target = hiddenFrame
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().setFrame(target, display: true)
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self, self.hidden else { return }
+            self.panel.orderOut(nil)
+        })
+    }
+
+    func reveal() {
+        guard hidden else { return }
+        hidden = false
+        edgeSince = nil
+        awaySince = nil
+        if !panel.isVisible {
+            panel.alphaValue = 0
+            panel.setFrame(hiddenFrame, display: false)
+            panel.orderFrontRegardless()
+        }
+        let target = shownFrame
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(target, display: true)
+            panel.animator().alphaValue = 1
+        }, completionHandler: { [panel] in panel.invalidateShadow() })
+    }
+}
+
+// MARK: - Global hotkey (⌃⌥D toggles Auto-Hide on the screen under the pointer)
+
+func registerAutoHideHotKey() {
+    var ref: EventHotKeyRef?
+    let id = EventHotKeyID(signature: OSType(0x5144_4B31), id: 1)  // 'QDK1'
+    RegisterEventHotKey(UInt32(kVK_ANSI_D), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        AppController.shared.toggleAutoHideUnderPointer()
+        return noErr
+    }, 1, &spec, nil, nil)
 }
 
 // MARK: - Setup assistant
@@ -1707,7 +1843,7 @@ struct OnboardingView: View {
             TipRow(icon: "hand.draw", title: "Move it",
                    text: "Drag the ⋮⋮ grip (or any empty spot). Drop near an edge to pin, anywhere else to float. Lock Position hides the grip.")
             TipRow(icon: "cursorarrow.click.2", title: "Right-click for everything",
-                   text: "Icon size, spacing, position, Dock Mode, running apps, Trash — or use the Q-Dock icon in the menu bar.")
+                   text: "Icon size, spacing, position, Auto-Hide (⌃⌥D), Dock Mode, running apps, Trash — or use the Q-Dock icon in the menu bar.")
             TipRow(icon: "square.and.arrow.down.on.square", title: "Drag and drop",
                    text: "Drop apps or files onto the dock to add them, onto a folder to move them in, or onto the Trash to delete. Drag an icon off the dock to remove it.")
             TipRow(icon: "folder", title: "Folders",
@@ -1762,6 +1898,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var running: Set<String> = []
     var trashFull = false
+    var menuDepth = 0
+    private var autoHideTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -1789,6 +1927,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.updateTrash() }
+        nc.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.menuDepth += 1
+        }
+        nc.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.menuDepth = max(0, self.menuDepth - 1)
+        }
+        registerAutoHideHotKey()
         trashFull = trashIsFull()
         updateRunning()
         rebuild(animated: false)
@@ -1830,6 +1976,31 @@ final class AppController: NSObject, NSApplicationDelegate {
             d.refresh(animated: animated)
         }
         DockMode.shared.update()
+        updateAutoHideTimer()
+    }
+
+    /// Polls the pointer (20×/s) only while some dock is set to auto-hide.
+    private func updateAutoHideTimer() {
+        let needed = docks.values.contains { $0.autoHide || $0.hidden }
+        if needed && autoHideTimer == nil {
+            let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                let m = NSEvent.mouseLocation
+                self.docks.values.forEach { $0.tickAutoHide(m) }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            autoHideTimer = t
+        } else if !needed {
+            autoHideTimer?.invalidate()
+            autoHideTimer = nil
+        }
+    }
+
+    func toggleAutoHideUnderPointer() {
+        let m = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(m, $0.frame, false) }),
+              store.placement(for: screen.stableID).edge != .free else { NSSound.beep(); return }
+        store.setAutoHide(!store.autoHide(for: screen.stableID), for: [screen.stableID])
     }
 
     /// Called after the user drags a dock; snaps to the nearest edge or leaves it floating.
@@ -1902,6 +2073,19 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         m.addItem(.separator())
         m.addItem(ActionItem("Lock Position", checked: locked) { [weak self] in self?.store.locked.toggle() })
+        let hideIDs = screenID.map { [$0] } ?? NSScreen.screens.map(\.stableID)
+        let hideOn = hideIDs.allSatisfy { store.autoHide(for: $0) }
+        let floating = screenID.map { store.placement(for: $0).edge == .free } ?? false
+        let hideTitle = floating ? "Auto-Hide (pin to an edge to use)"
+                                 : (screenID == nil ? "Auto-Hide (all screens)" : "Auto-Hide (this screen)")
+        let hideItem = ActionItem(hideTitle, checked: hideOn && !floating, enabled: !floating) { [weak self] in
+            self?.store.setAutoHide(!hideOn, for: hideIDs)
+        }
+        if screenID != nil {
+            hideItem.keyEquivalent = "d"
+            hideItem.keyEquivalentModifierMask = [.control, .option]
+        }
+        m.addItem(hideItem)
         m.addItem(ActionItem("Dock Mode (keep windows out from behind)", checked: store.dockMode) { [weak self] in
             self?.toggleDockMode()
         })

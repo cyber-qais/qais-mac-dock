@@ -41,6 +41,7 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 🖥️ **Every screen** | A dock on each display. Each one can sit on a different edge, or they can all share one position. |
 | 📌 **Pin anywhere** | Snap to the left, right, top or bottom edge, or float it anywhere (vertical or horizontal). |
 | 🔒 **Lock Position** | Freeze it in place. The ⋮⋮ grip disappears until you unlock. |
+| 🫥 **Auto-Hide** | Per screen. The dock slides off its edge and comes back when you push the pointer against that edge. Toggle it with **⌃⌥D**. |
 | 🪟 **Dock Mode** | Keeps other windows out from behind an edge-pinned dock by nudging or resizing them. |
 | 🏷️ **Instant labels** | App names appear the moment you hover, with a small genie-style magnification. |
 | 📂 **Folder stacks** | Open folders as a **Fan** or **Grid**, with previews. Drag files out, drop files in, and right-click to copy, rename or trash. |
@@ -148,6 +149,17 @@ To move files **into** a folder, drop them onto its dock icon. Files on the same
 files from another drive are copied, as in Finder. Hold **⌥** to always copy. If a name is already
 taken, the new file gets a number added (`report 2.pdf`).
 
+### Auto-Hide
+
+Right-click the dock → **Auto-Hide (this screen)**, or press **⌃⌥D** with the pointer on that screen.
+
+- The dock slides off its edge half a second after the pointer leaves it.
+- **Push the pointer against that edge** for a moment to bring it back.
+- It stays visible while a folder stack or menu is open, or while you're dragging.
+- It's set per screen, so you can hide the dock on your laptop screen and keep it on your big monitor.
+- It works on docks pinned to an edge. A floating dock doesn't auto-hide.
+- An auto-hidden dock doesn't reserve space in Dock Mode, so windows can use the whole screen.
+
 ### Dock Mode
 
 Turn on **Dock Mode** to keep windows from sitting behind an edge-pinned dock. When a window overlaps the
@@ -173,6 +185,7 @@ The defaults are:
 | Icon Size | Small (32 pt) | Tiny 28 · Small 32 · Medium-Small 40 · Medium 48 · Medium-Large 56 · Large 64 · Huge 80 |
 | Icon Spacing | Tight (0) | Tight 0 · Compact 2 · Normal 6 · Roomy 12 |
 | Lock Position | On | |
+| Auto-Hide | Off | Per screen · ⌃⌥D toggles it on the screen under the pointer |
 | Dock Mode | On (once Accessibility is allowed) | |
 | Keep Above Other Windows | On | |
 | Show Running Apps | On | |
