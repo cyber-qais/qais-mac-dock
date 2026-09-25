@@ -7,6 +7,7 @@ APP=Q-Dock.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+xcrun --sdk macosx swift tools/make-icon.swift assets/icon.png "$APP/Contents/Resources/AppIcon.icns"
 xcrun --sdk macosx swiftc -O -target "$(uname -m)-apple-macos14.0" main.swift -module-name QDock -o "$APP/Contents/MacOS/Q-Dock"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -18,6 +19,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Q-Dock</string>
   <key>CFBundleIdentifier</key><string>com.local.qdock</string>
   <key>CFBundleExecutable</key><string>Q-Dock</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>

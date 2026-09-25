@@ -226,10 +226,12 @@ final class HoverLabel {
     func show(_ v: IconView) {
         guard let r = v.screenIconRect, let screen = v.window?.screen else { return }
         field.stringValue = v.displayName
-        let ts = (v.displayName as NSString).size(withAttributes: [.font: field.font!])
-        let textW = min(ceil(ts.width) + 2, HoverLabel.maxTextWidth)
+        // Let the text field size itself so its internal cell padding is included; cap at the max width.
+        field.sizeToFit()
+        let fit = field.frame.size
+        let textW = min(ceil(fit.width) + 2, HoverLabel.maxTextWidth)
         let size = NSSize(width: textW + 20, height: 24)
-        field.frame = NSRect(x: 10, y: (size.height - ceil(ts.height)) / 2, width: textW, height: ceil(ts.height))
+        field.frame = NSRect(x: 10, y: (size.height - fit.height) / 2, width: textW, height: fit.height)
         let gap = v.s * (kMagnify - 1) + 8
         var o: NSPoint
         switch v.dotSide {

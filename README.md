@@ -15,6 +15,8 @@ A floating, pinnable dock for macOS, with a copy on every screen.
 rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applications/ && open ~/Applications/Q-Dock.app
 ```
 
+App icon: `assets/icon.png` (converted to `.icns` by `tools/make-icon.swift` during the build).
+
 Requires Xcode (uses `xcrun swiftc`), macOS 14+. The app is ad-hoc signed, so macOS asks for
 Accessibility permission (Dock Mode) again after each rebuild.
 
