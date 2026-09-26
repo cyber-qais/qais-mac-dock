@@ -38,7 +38,7 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 
 | | |
 |---|---|
-| 🖥️ **Every screen** | A dock on each display. Each one can sit on a different edge, or they can all share one position. |
+| 🖥️ **Every screen** | A dock on each display, each with its own position, icon size, spacing and options, or shared settings everywhere. |
 | 📌 **Pin anywhere** | Snap to the left, right, top or bottom edge, or float it anywhere (vertical or horizontal). |
 | 🔒 **Lock Position** | Freeze it in place. The ⋮⋮ grip disappears until you unlock. |
 | 🙈 **Hide the macOS Dock** | Optional. Keeps the built-in Dock out of sight so only Q-Dock shows, and brings it back when Q-Dock quits if you want. |
@@ -48,6 +48,9 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 📂 **Folder stacks** | Open folders as a **Fan** or **Grid**, with previews. Drag files out, drop files in, and right-click to copy, rename or trash. |
 | ⚙️ **Running apps** | Open apps that aren't pinned show up after a separator. Drag one in to pin it. |
 | 🗑️ **Trash** | Shows empty or full. Drop files on it to trash them, or drop a dock icon on it to remove it. |
+| 🎨 **Folder icons** | Give each docked folder its own color, a symbol (⭐️, 📷, </>, …) or any image or app icon. |
+| ➗ **Separators & spacers** | Group your apps with separators, spacers and small spacers, placed anywhere. |
+| ⬆️ **One-click updates** | Q-Dock tells you when a new version is out and can update and restart itself. |
 | 📏 **Density** | Icon sizes from Tiny to Huge and spacing from Tight to Roomy. Long docks wrap onto more rows. |
 | 🧭 **Setup assistant** | A first-launch walkthrough for permissions and the basics. |
 
@@ -126,6 +129,7 @@ pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applicat
 | Add an app, file or folder | Drag it from Finder onto the dock, or use **Add Apps or Files…** |
 | Reorder | Drag an icon along the dock |
 | Remove | Drag the icon off the dock, or drop it on the Trash, or right-click → **Remove from Dock** |
+| Add a separator or spacer | Right-click an icon → **Insert After This** → *Separator / Spacer / Small Spacer*, or right-click the dock → **Add Separator or Spacer**. Drag it to move it; drag it off to remove it. |
 | Pin a running app | Drag it from the running section into the pinned area, or right-click → **Keep in Dock** |
 | Open a file with a specific app | Drop the file onto that app's icon |
 | Quit an app | Right-click → **Quit**, or **Force Quit** (no ⌥ needed) |
@@ -148,6 +152,9 @@ Inside an open stack:
 - **Click** a file to open it.
 - **Drag** a file out into Finder, an email or any other app.
 - **Right-click** a file for **Open**, **Open Folder**, **Copy**, **Copy Path**, **Rename…** or **Move to Trash**.
+
+**Folder icons:** right-click a docked folder → **Folder Icon** to pick a **Color**, a **Symbol**, or a
+**Custom Image…** (any image, `.icns` file or app). **Reset to Default** puts the normal folder back.
 
 To move files **into** a folder, drop them onto its dock icon. Files on the same drive are moved and
 files from another drive are copied, as in Finder. Hold **⌥** to always copy. If a name is already
@@ -185,8 +192,25 @@ Turn on **Dock Mode** to keep windows from sitting behind an edge-pinned dock. W
 dock, Q-Dock shrinks it (or moves it if it's small) so it stays clear. It skips full-screen windows and
 does nothing for a floating dock.
 
-macOS has no public way for an app to reserve screen space, so Dock Mode uses the Accessibility API and
-needs **Accessibility** permission.
+Dock Mode also keeps **desktop icons** clear. Finder doesn't know about Q-Dock, so a file you drop, a new
+screenshot or a download can land under the dock. Every few seconds, Q-Dock moves any desktop icon that's under
+an edge-pinned dock to just past it. (If your desktop uses **Sort By**, Finder arranges the icons itself and
+won't let them be moved.)
+
+macOS has no public way for an app to reserve screen space. So Dock Mode uses the Accessibility API for windows,
+which needs **Accessibility** permission, and Finder scripting for desktop icons, which macOS asks you to allow once.
+
+## Updates
+
+Q-Dock checks GitHub for a new release when it starts and once a day. When there is one, it shows what's new
+and offers **Update & Restart**, **Later** or **Skip This Version**. **Update & Restart** downloads the new
+version, checks that it's signed with the same certificate as the running app, swaps it in and relaunches.
+Your settings and permissions carry over.
+
+- **Check for Updates…** in the menu checks right away. Turn off **Check for Updates Automatically** to stop the daily check.
+- If Q-Dock can't replace itself (for example, it's in a folder you can't write to), it opens the download page instead.
+- Builds you make yourself won't take updates from GitHub, because they're signed with a different certificate.
+  Update those with `git pull && ./build.sh`.
 
 ## Settings
 
@@ -194,9 +218,15 @@ needs **Accessibility** permission.
 
 Everything is in the right-click menu (right) and the menu-bar icon.
 
+**Each screen can have its own settings.** Right-click a dock to change settings under **This Screen**, which
+covers position, icon size, spacing, Lock Position, Auto-Hide, Dock Mode, Keep Above Other Windows, Show Running Apps
+and Show Trash. The menu-bar icon changes the same settings for **All Screens** at once. A screen with its own
+settings shows **Use Shared Settings on This Screen** to go back to the shared ones. Pinned items, **Hide macOS
+Dock**, **Launch at Login** and updates apply everywhere.
+
 <br clear="right">
 
-The defaults are:
+The defaults (shared by every screen until a screen sets its own) are:
 
 | Setting | Default | Options |
 |---|---|---|
@@ -213,6 +243,7 @@ The defaults are:
 | Show on All Screens | On | |
 | Same Position on Every Screen | Off | |
 | Launch at Login | Off | |
+| Check for Updates Automatically | On | |
 
 ### Scripting settings
 
@@ -253,7 +284,7 @@ pkill -x Q-Dock; defaults delete com.local.qdock; open ~/Applications/Q-Dock.app
 |---|---|---|
 | Accessibility | Dock Mode (moving other windows) | System Settings → Privacy & Security → Accessibility |
 | Full Disk Access | The Trash full/empty icon; opening protected folders as stacks | System Settings → Privacy & Security → Full Disk Access |
-| Automation (Finder) | **Empty Trash…** | macOS asks the first time you use it |
+| Automation (Finder) | Keeping desktop icons clear in Dock Mode; **Empty Trash…** | macOS asks the first time it's needed |
 
 The setup assistant opens on first launch, and you can reopen it anytime from **Setup Assistant…** in the menu.
 It shows live status for each permission and links to the right Settings page.

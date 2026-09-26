@@ -2,10 +2,12 @@
 import AppKit
 import Carbon
 import ApplicationServices
+import Security
 import Combine
 import QuickLookThumbnailing
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 let kPad: CGFloat = 10
 let kDot: CGFloat = 6
@@ -42,10 +44,12 @@ final class Store {
 
     var items: [URL] {
         get {
-            if let paths = d.stringArray(forKey: "items") { return paths.map { URL(fileURLWithPath: $0) } }
+            if let paths = d.stringArray(forKey: "items") {
+                return paths.map { $0.hasPrefix("qdock://") ? (URL(string: $0) ?? URL(fileURLWithPath: $0)) : URL(fileURLWithPath: $0) }
+            }
             return systemDockItems()
         }
-        set { d.set(newValue.map(\.path), forKey: "items"); post() }
+        set { d.set(newValue.map(itemKey), forKey: "items"); post() }
     }
     private func bool(_ key: String, _ def: Bool) -> Bool { d.object(forKey: key) as? Bool ?? def }
     private func setBool(_ key: String, _ v: Bool) { d.set(v, forKey: key); post() }
@@ -70,6 +74,8 @@ final class Store {
         get { bool("restoreSystemDockOnQuit", true) }
         set { setBool("restoreSystemDockOnQuit", newValue) }
     }
+    var autoCheckUpdates: Bool { get { bool("autoCheckUpdates", true) } set { d.set(newValue, forKey: "autoCheckUpdates") } }
+    var skippedVersion: String? { get { d.string(forKey: "skippedVersion") } set { d.set(newValue, forKey: "skippedVersion") } }
     var askedSystemDock: Bool { get { bool("askedSystemDock", false) } set { d.set(newValue, forKey: "askedSystemDock") } }
 
     private var placements: [String: Placement] {
@@ -87,6 +93,42 @@ final class Store {
         }
         return Placement(edge: .bottom, fx: 0.88, fy: 0, vertical: false)
     }
+    // Per-screen settings: a screen's own value if it has one, otherwise the shared value.
+    private var screenPrefs: [String: [String: Any]] {
+        get { d.dictionary(forKey: "screenPrefs") as? [String: [String: Any]] ?? [:] }
+        set { d.set(newValue, forKey: "screenPrefs") }
+    }
+    private func perScreen<T>(_ key: String, _ id: String?, _ shared: T) -> T {
+        if let id, let v = screenPrefs[id]?[key] as? T { return v }
+        return shared
+    }
+    /// With a screen ID, sets that screen's own value. Without one, sets the shared value for every screen.
+    func setPerScreen(_ key: String, _ value: Any, screen id: String?) {
+        var p = screenPrefs
+        if let id {
+            p[id, default: [:]][key] = value
+        } else {
+            d.set(value, forKey: key)
+            for k in p.keys { p[k]?[key] = nil }
+        }
+        screenPrefs = p.filter { !$0.value.isEmpty }
+        post()
+    }
+    func hasOwnSettings(_ id: String) -> Bool { !(screenPrefs[id] ?? [:]).isEmpty }
+    func clearOwnSettings(_ id: String) {
+        var p = screenPrefs
+        p[id] = nil
+        screenPrefs = p
+        post()
+    }
+    func iconSize(for id: String?) -> CGFloat { CGFloat(perScreen("iconSize", id, Double(iconSize))) }
+    func spacing(for id: String?) -> CGFloat { CGFloat(perScreen("spacing", id, Double(spacing))) }
+    func locked(for id: String?) -> Bool { perScreen("locked", id, locked) }
+    func showTrash(for id: String?) -> Bool { perScreen("showTrash", id, showTrash) }
+    func showRunning(for id: String?) -> Bool { perScreen("showRunning", id, showRunning) }
+    func alwaysOnTop(for id: String?) -> Bool { perScreen("alwaysOnTop", id, alwaysOnTop) }
+    func dockMode(for id: String?) -> Bool { perScreen("dockMode", id, dockMode) }
+
     private var autoHideMap: [String: Bool] {
         get { d.dictionary(forKey: "autoHide") as? [String: Bool] ?? [:] }
         set { d.set(newValue, forKey: "autoHide") }
@@ -122,12 +164,34 @@ final class Store {
 
     func add(_ urls: [URL], at index: Int? = nil) {
         var it = items
-        let new = urls.filter { u in !it.contains { $0.path == u.path } }
+        let new = urls.filter { u in !it.contains { itemKey($0) == itemKey(u) } }
         guard !new.isEmpty else { return }
         it.insert(contentsOf: new, at: min(index ?? it.count, it.count))
         items = it
     }
-    func remove(_ url: URL) { items = items.filter { $0.path != url.path } }
+    func remove(_ url: URL) { items = items.filter { itemKey($0) != itemKey(url) } }
+
+    /// Adds a separator or spacer after `after` (or at the end).
+    func addDecoration(_ kind: IconView.Kind, after: URL?) {
+        let name = kind == .separator ? "separator" : kind == .smallSpacer ? "smallspacer" : "spacer"
+        let u = URL(string: "qdock://\(name)/\(UUID().uuidString)")!
+        var it = items
+        let i = after.flatMap { a in it.firstIndex { itemKey($0) == itemKey(a) } }.map { $0 + 1 } ?? it.count
+        it.insert(u, at: i)
+        items = it
+    }
+
+    private var folderStyles: [String: FolderStyle] {
+        get { d.data(forKey: "folderStyles").flatMap { try? JSONDecoder().decode([String: FolderStyle].self, from: $0) } ?? [:] }
+        set { d.set(try? JSONEncoder().encode(newValue), forKey: "folderStyles") }
+    }
+    func folderStyle(for u: URL) -> FolderStyle { folderStyles[u.path] ?? FolderStyle() }
+    func setFolderStyle(_ s: FolderStyle, for u: URL) {
+        var m = folderStyles
+        m[u.path] = s.isDefault ? nil : s
+        folderStyles = m
+        post()
+    }
     func move(from: Int, to: Int) {
         var it = items
         guard from != to, it.indices.contains(from) else { return }
@@ -151,6 +215,72 @@ extension NSScreen {
 }
 
 func canonicalPath(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
+
+/// How an item is stored: a file path, or a qdock:// URL for separators and spacers.
+func itemKey(_ u: URL) -> String { u.isFileURL ? u.path : u.absoluteString }
+
+// MARK: - Folder icon styles
+
+struct FolderStyle: Codable, Equatable {
+    var color: String?
+    var symbol: String?
+    var image: String?
+    var isDefault: Bool { color == nil && symbol == nil && image == nil }
+}
+
+let folderColors: [(key: String, name: String, color: NSColor)] = [
+    ("blue", "Blue", .systemBlue), ("purple", "Purple", .systemPurple), ("pink", "Pink", .systemPink),
+    ("red", "Red", .systemRed), ("orange", "Orange", .systemOrange), ("yellow", "Yellow", .systemYellow),
+    ("green", "Green", .systemGreen), ("teal", "Teal", .systemTeal), ("graphite", "Graphite", .systemGray),
+]
+
+let folderSymbols: [(symbol: String, name: String)] = [
+    ("star.fill", "Star"), ("heart.fill", "Heart"), ("arrow.down.circle.fill", "Download"), ("camera.fill", "Camera"),
+    ("photo.fill", "Photos"), ("doc.text.fill", "Document"), ("music.note", "Music"), ("film.fill", "Movies"),
+    ("briefcase.fill", "Work"), ("chevron.left.forwardslash.chevron.right", "Code"), ("hammer.fill", "Tools"),
+    ("cloud.fill", "Cloud"), ("person.fill", "Person"), ("house.fill", "Home"), ("tray.full.fill", "Inbox"),
+    ("lock.fill", "Private"), ("bolt.fill", "Bolt"), ("flag.fill", "Flag"),
+]
+
+/// A folder's icon with its color tint, emblem symbol, or custom image applied (nil if it has no style).
+func styledFolderIcon(_ url: URL) -> NSImage? {
+    let st = Store.shared.folderStyle(for: url)
+    guard !st.isDefault else { return nil }
+    if let path = st.image, FileManager.default.fileExists(atPath: path) {
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ["app", "icns"].contains(ext) || (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            return NSWorkspace.shared.icon(forFile: path)
+        }
+        if let img = NSImage(contentsOfFile: path) { return img }
+    }
+    // A chosen symbol replaces any built-in emblem (e.g. Downloads' arrow), so start from a plain folder.
+    let base = st.symbol != nil ? NSWorkspace.shared.icon(for: .folder) : NSWorkspace.shared.icon(forFile: url.path)
+    let tint = folderColors.first { $0.key == st.color }?.color
+    return NSImage(size: NSSize(width: 256, height: 256), flipped: false) { r in
+        base.draw(in: r)
+        if let tint {
+            // Take the tint's hue/saturation, keep the folder's shading, then clip back to the folder shape.
+            tint.setFill()
+            r.fill(using: .color)
+            base.draw(in: r, from: .zero, operation: .destinationIn, fraction: 1)
+        }
+        if let sym = st.symbol,
+           let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+               .withSymbolConfiguration(.init(pointSize: r.width * 0.26, weight: .semibold)) {
+            let ink = (tint ?? NSColor(calibratedRed: 0.29, green: 0.6, blue: 0.9, alpha: 1)).shadow(withLevel: 0.45) ?? .darkGray
+            let s = img.size
+            let box = NSRect(x: r.midX - s.width / 2, y: r.height * 0.40 - s.height / 2, width: s.width, height: s.height)
+            let glyph = NSImage(size: s, flipped: false) { gr in
+                img.draw(in: gr)
+                ink.withAlphaComponent(0.75).set()
+                gr.fill(using: .sourceAtop)
+                return true
+            }
+            glyph.draw(in: box)
+        }
+        return true
+    }
+}
 
 func displayName(_ url: URL) -> String {
     let n = FileManager.default.displayName(atPath: url.path)
@@ -275,7 +405,7 @@ final class HoverLabel {
 // MARK: - Dock icon
 
 final class IconView: NSView {
-    enum Kind { case item, running, trash }
+    enum Kind { case item, running, trash, separator, spacer, smallSpacer }
     let url: URL
     let kind: Kind
     let s: CGFloat
@@ -293,9 +423,11 @@ final class IconView: NSView {
         self.kind = kind
         self.s = size
         self.dotSide = dotSide
-        self.image = image ?? NSWorkspace.shared.icon(forFile: url.path)
-        let rv = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        let decoration = kind == .separator || kind == .spacer || kind == .smallSpacer
+        self.image = image ?? (decoration ? NSImage() : NSWorkspace.shared.icon(forFile: url.path))
+        let rv = url.isFileURL ? try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) : nil
         isFolder = kind == .item && (rv?.isDirectory ?? false) && !(rv?.isPackage ?? false)
+        if isFolder, image == nil, let styled = styledFolderIcon(url) { self.image = styled }
         super.init(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
         wantsLayer = true
         clipsToBounds = false
@@ -307,6 +439,9 @@ final class IconView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     var displayName: String { kind == .trash ? "Trash" : QDock.displayName(url) }
+    var isDecoration: Bool { kind == .separator || kind == .spacer || kind == .smallSpacer }
+    /// Length along the dock's main axis.
+    var mainLength: CGFloat { kind == .separator ? kSep : kind == .smallSpacer ? s / 2 : s }
     var runningApp: NSRunningApplication? {
         let p = canonicalPath(url)
         return NSWorkspace.shared.runningApplications.first { $0.bundleURL.map(canonicalPath) == p }
@@ -403,10 +538,20 @@ final class IconView: NSView {
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseEntered(with e: NSEvent) { dock?.hover(self, inside: true) }
-    override func mouseExited(with e: NSEvent) { dock?.hover(self, inside: false) }
+    override func mouseEntered(with e: NSEvent) { if !isDecoration { dock?.hover(self, inside: true) } }
+    override func mouseExited(with e: NSEvent) { if !isDecoration { dock?.hover(self, inside: false) } }
 
     override func draw(_ dirtyRect: NSRect) {
+        if kind == .separator {
+            NSColor.labelColor.withAlphaComponent(0.25).setFill()
+            let r = iconRect, half = s * 0.4
+            if dotSide == .left || dotSide == .right {
+                NSBezierPath(rect: NSRect(x: r.midX - half, y: bounds.midY - 0.5, width: half * 2, height: 1)).fill()
+            } else {
+                NSBezierPath(rect: NSRect(x: bounds.midX - 0.5, y: r.midY - half, width: 1, height: half * 2)).fill()
+            }
+            return
+        }
         if running {
             NSColor.labelColor.withAlphaComponent(0.8).setFill()
             let c = dotCenter
@@ -415,6 +560,7 @@ final class IconView: NSView {
     }
 
     func open(event: NSEvent? = nil) {
+        if isDecoration { return }
         if kind == .trash {
             NSWorkspace.shared.open(trashURL)
         } else if isFolder && Store.shared.stackStyle(for: url) != .folder {
@@ -446,9 +592,63 @@ final class IconView: NSView {
         }
     }
 
+    private func folderIconMenu(_ u: URL) -> NSMenu {
+        let st = Store.shared.folderStyle(for: u)
+        let menu = NSMenu()
+        let colors = NSMenu()
+        colors.addItem(ActionItem("Default", checked: st.color == nil) {
+            var s = Store.shared.folderStyle(for: u); s.color = nil; s.image = nil; Store.shared.setFolderStyle(s, for: u)
+        })
+        colors.addItem(.separator())
+        for c in folderColors {
+            let item = ActionItem(c.name, checked: st.color == c.key) {
+                var s = Store.shared.folderStyle(for: u); s.color = c.key; s.image = nil; Store.shared.setFolderStyle(s, for: u)
+            }
+            item.image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { r in
+                c.color.setFill(); NSBezierPath(ovalIn: r).fill(); return true
+            }
+            colors.addItem(item)
+        }
+        menu.addItem(submenuItem("Color", colors))
+        let symbols = NSMenu()
+        symbols.addItem(ActionItem("None", checked: st.symbol == nil) {
+            var s = Store.shared.folderStyle(for: u); s.symbol = nil; Store.shared.setFolderStyle(s, for: u)
+        })
+        symbols.addItem(.separator())
+        for sym in folderSymbols {
+            let item = ActionItem(sym.name, checked: st.symbol == sym.symbol) {
+                var s = Store.shared.folderStyle(for: u); s.symbol = sym.symbol; s.image = nil; Store.shared.setFolderStyle(s, for: u)
+            }
+            item.image = NSImage(systemSymbolName: sym.symbol, accessibilityDescription: nil)
+            symbols.addItem(item)
+        }
+        menu.addItem(submenuItem("Symbol", symbols))
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Custom Image…", checked: st.image != nil) {
+            NSApp.activate(ignoringOtherApps: true)
+            let p = NSOpenPanel()
+            p.message = "Choose an image, .icns file, or app to use as this folder's icon."
+            p.allowedContentTypes = [.image, .icns, .application]
+            p.directoryURL = URL(fileURLWithPath: "/Applications")
+            if p.runModal() == .OK, let pick = p.url {
+                Store.shared.setFolderStyle(FolderStyle(image: pick.path), for: u)
+            }
+        })
+        menu.addItem(ActionItem("Reset to Default", enabled: !st.isDefault) { Store.shared.setFolderStyle(FolderStyle(), for: u) })
+        return menu
+    }
+
     override func rightMouseDown(with e: NSEvent) {
         HoverLabel.shared.hide()
         let m = NSMenu()
+        if isDecoration {
+            let u = url
+            m.addItem(ActionItem(kind == .separator ? "Remove Separator" : "Remove Spacer") { Store.shared.remove(u) })
+            m.addItem(.separator())
+            m.addItem(submenuItem("Q-Dock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
+            NSMenu.popUpContextMenu(m, with: e, for: self)
+            return
+        }
         m.addItem(NSMenuItem(title: displayName, action: nil, keyEquivalent: ""))
         m.addItem(.separator())
         if kind == .trash {
@@ -481,6 +681,7 @@ final class IconView: NSView {
                     sorts.addItem(ActionItem(name, checked: sort == so) { Store.shared.setStackSort(so, for: u) })
                 }
                 m.addItem(submenuItem("Sort By", sorts))
+                m.addItem(submenuItem("Folder Icon", folderIconMenu(u)))
             } else {
                 m.addItem(ActionItem("Open") { [weak self] in self?.open() })
             }
@@ -491,12 +692,22 @@ final class IconView: NSView {
                 m.addItem(ActionItem("Force Quit") { app.forceTerminate() })
             }
             m.addItem(.separator())
+            m.addItem(submenuItem("Insert After This", decorationMenu(after: u)))
             m.addItem(ActionItem("Remove from Dock") { Store.shared.remove(u) })
         }
         m.addItem(.separator())
         m.addItem(submenuItem("Q-Dock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
         NSMenu.popUpContextMenu(m, with: e, for: self)
     }
+}
+
+/// Separator / spacer choices, inserted after `after` (or at the end).
+func decorationMenu(after: URL?) -> NSMenu {
+    let m = NSMenu()
+    m.addItem(ActionItem("Separator") { Store.shared.addDecoration(.separator, after: after) })
+    m.addItem(ActionItem("Spacer") { Store.shared.addDecoration(.spacer, after: after) })
+    m.addItem(ActionItem("Small Spacer") { Store.shared.addDecoration(.smallSpacer, after: after) })
+    return m
 }
 
 // MARK: - Dock view
@@ -612,7 +823,14 @@ final class DockView: NSView {
             self.addSubview(v)
             return v
         }
-        icons = items.map { make($0, .item, nil) }
+        icons = items.map { u in
+            guard u.scheme == "qdock" else { return make(u, .item, nil) }
+            switch u.host {
+            case "separator": return make(u, .separator, nil)
+            case "smallspacer": return make(u, .smallSpacer, nil)
+            default: return make(u, .spacer, nil)
+            }
+        }
         extras = running.map { make($0, .running, nil) }
         trash = showTrash ? make(trashURL, .trash, trashImage(full: trashFull)) : nil
         computeLayout()
@@ -623,10 +841,11 @@ final class DockView: NSView {
     }
 
     /// Flow layout: pinned items (or placeholder) · separator · running apps · trash, wrapping onto new lines.
-    private func computeLayout() {
-        let pinnedCount = max(icons.count, 1)
+    private func computeLayout(order: [IconView]? = nil) {
+        let pinned = order ?? icons
+        let pinnedCount = max(pinned.count, 1)
         let hasSep = !tail.isEmpty
-        var lens = Array(repeating: s, count: pinnedCount)
+        var lens = pinned.isEmpty ? [s] : pinned.map(\.mainLength)
         if hasSep { lens.append(kSep) }
         lens += Array(repeating: s, count: tail.count)
         var raw: [(line: Int, main: CGFloat, len: CGFloat)] = []
@@ -663,18 +882,22 @@ final class DockView: NSView {
         }
     }
 
-    private func nearestSlot(_ p: NSPoint) -> Int {
-        slotFrames.indices.min { hypot(slotFrames[$0].midX - p.x, slotFrames[$0].midY - p.y) < hypot(slotFrames[$1].midX - p.x, slotFrames[$1].midY - p.y) } ?? 0
+    /// Position in reading order: (line from the pinned edge, distance along the dock).
+    private func readingKey(_ p: NSPoint) -> (Int, CGFloat) {
+        let c = vertical ? p.x : p.y
+        let vl = max(0, min(lineCount - 1, Int(((c - kPad) / (cellCross + sp)).rounded(.down))))
+        return (visualLine(vl), main(p))
+    }
+    private func isBefore(_ f: NSRect, _ p: NSPoint) -> Bool {
+        let a = readingKey(NSPoint(x: f.midX, y: f.midY)), b = readingKey(p)
+        return a.0 < b.0 || (a.0 == b.0 && a.1 < b.1)
     }
     /// Where a dropped item would be inserted among the pinned items.
     private func insertionIndex(_ p: NSPoint) -> Int {
-        guard !icons.isEmpty else { return 0 }
-        let i = nearestSlot(p)
-        return main(p) > main(NSPoint(x: slotFrames[i].midX, y: slotFrames[i].midY)) ? i + 1 : i
+        icons.isEmpty ? 0 : slotFrames.filter { isBefore($0, p) }.count
     }
     private func nearPinned(_ p: NSPoint) -> Bool {
-        let f = slotFrames[nearestSlot(p)]
-        return hypot(f.midX - p.x, f.midY - p.y) < s
+        slotFrames.contains { $0.insetBy(dx: -s / 2, dy: -s / 2).contains(p) }
     }
 
     private var placeholderRect: NSRect {
@@ -735,7 +958,7 @@ final class DockView: NSView {
         let crossOf = { (v: IconView) in self.vertical ? v.frame.minX : v.frame.minY }
         for (i, v) in views.enumerated() {
             var m: CGFloat = 1
-            if let hi {
+            if let hi, !v.isDecoration {
                 if i == hi { m = kMagnify } else if abs(i - hi) == 1 && crossOf(v) == crossOf(views[hi]) { m = kNeighbor }
             }
             v.setMagnification(m, genie: i == hi)
@@ -771,12 +994,14 @@ final class DockView: NSView {
         v.dimmed = onTrash || !bounds.insetBy(dx: -40, dy: -40).contains(p)
         trash?.setMagnification(onTrash ? kMagnify : 1, genie: onTrash)
         (v.dimmed ? NSCursor.disappearingItem : NSCursor.arrow).set()
-        let t = min(nearestSlot(NSPoint(x: v.frame.midX, y: v.frame.midY)), icons.count - 1)
+        let center = NSPoint(x: v.frame.midX, y: v.frame.midY)
+        let t = zip(order, slotFrames).filter { $0.0 !== v && isBefore($0.1, center) }.count
         if t != dragTarget && !onTrash {
             order.removeAll { $0 === v }
             order.insert(v, at: t)
             dragOrder = order
             dragTarget = t
+            computeLayout(order: order)
             layoutIcons(order, animated: true, except: v)
         }
     }
@@ -797,6 +1022,7 @@ final class DockView: NSView {
         trash?.setMagnification(1, genie: false)
         if v.dimmed { Store.shared.remove(v.url); return }
         if from == dragTarget {
+            computeLayout()
             layoutIcons(icons, animated: true, except: nil)
         } else {
             Store.shared.move(from: from, to: dragTarget)
@@ -1217,7 +1443,7 @@ final class StackController: NSObject, NSWindowDelegate {
 
         var views: [StackItemView] = shown.map { item($0, style: style, thumbSize: 36) }
         let finder = StackItemView(url: nil, title: more > 0 ? "Open in Finder (\(more) more)" : "Open in Finder",
-                                   image: NSWorkspace.shared.icon(forFile: icon.url.path), style: style)
+                                   image: styledFolderIcon(icon.url) ?? NSWorkspace.shared.icon(forFile: icon.url.path), style: style)
         finder.onClick = { [weak self] in self?.openFolder() }
         views.append(finder)
 
@@ -1388,7 +1614,7 @@ final class DockMode {
     private var timer: Timer?
 
     func update() {
-        guard Store.shared.dockMode else {
+        guard AppController.shared.docks.values.contains(where: { Store.shared.dockMode(for: $0.screenID) }) else {
             timer?.invalidate()
             timer = nil
             return
@@ -1400,9 +1626,9 @@ final class DockMode {
     }
 
     /// Strips of screen (Cocoa coordinates) that edge-pinned docks reserve.
-    private func reserved() -> [(Edge, NSRect)] {
+    func reserved() -> [(Edge, NSRect)] {
         AppController.shared.docks.values.compactMap { d in
-            guard !d.autoHide else { return nil }
+            guard !d.autoHide, Store.shared.dockMode(for: d.screenID) else { return nil }
             let f = d.panel.frame, s = d.screen.frame, g: CGFloat = 4
             switch Store.shared.placement(for: d.screenID).edge {
             case .left: return (.left, NSRect(x: s.minX, y: s.minY, width: f.maxX + g - s.minX, height: s.height))
@@ -1479,6 +1705,123 @@ final class DockMode {
     }
 }
 
+// MARK: - Desktop guard (keeps Finder's desktop icons out from behind Dock Mode docks)
+
+/// Finder places desktop icons without knowing about Q-Dock, so while Dock Mode is on, icons that land under
+/// an edge-pinned dock (dropped there, a new screenshot, a download…) are moved just past it.
+/// Uses Finder scripting, which macOS asks permission for once.
+final class DesktopGuard {
+    static let shared = DesktopGuard()
+    private var timer: Timer?
+    private var busy = false
+    private(set) var automationDenied = false
+
+    func update() {
+        let on = AppController.shared.anyDockMode && !automationDenied
+        if on && timer == nil {
+            timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
+            tick()
+        } else if !on {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    /// Lets the user retry after granting permission in System Settings.
+    func retry() {
+        automationDenied = false
+        update()
+    }
+
+    private func osascript(_ script: String) -> (out: String, status: Int32, err: String) {
+        let p = Process(), out = Pipe(), err = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        p.standardOutput = out
+        p.standardError = err
+        do { try p.run() } catch { return ("", -1, "\(error)") }
+        let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (String(decoding: o, as: UTF8.self), p.terminationStatus, String(decoding: e, as: UTF8.self))
+    }
+
+    private func tick() {
+        guard !busy, NSEvent.pressedMouseButtons == 0,
+              NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.apple.finder" }),
+              let primary = NSScreen.screens.first?.frame else { return }
+        // Reserved strips in Finder's desktop coordinates (origin at the main screen's top-left, y down).
+        let strips = DockMode.shared.reserved().map { (e, r) in
+            (e, NSRect(x: r.minX, y: primary.height - r.maxY, width: r.width, height: r.height))
+        }
+        guard !strips.isEmpty else { return }
+        busy = true
+        DispatchQueue.global(qos: .utility).async {
+            let read = """
+            tell application "Finder"
+                set out to ((icon size of icon view options of window of desktop) as text)
+                repeat with i in (every item of desktop)
+                    set p to desktop position of i
+                    set out to out & linefeed & ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & (name of i)
+                end repeat
+                return out
+            end tell
+            """
+            let r = self.osascript(read)
+            if r.status != 0 {
+                if r.err.contains("-1743") || r.err.contains("Not authorized") {
+                    DispatchQueue.main.async { self.automationDenied = true; self.update(); self.busy = false }
+                } else {
+                    DispatchQueue.main.async { self.busy = false }
+                }
+                return
+            }
+            let lines = r.out.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+            guard let first = lines.first, let size = Double(first.trimmingCharacters(in: .whitespaces)) else {
+                DispatchQueue.main.async { self.busy = false }
+                return
+            }
+            var icons: [(name: String, p: CGPoint)] = lines.dropFirst().compactMap { line in
+                let parts = line.split(separator: ",", maxSplits: 2, omittingEmptySubsequences: false)
+                guard parts.count == 3, let x = Double(parts[0]), let y = Double(parts[1]) else { return nil }
+                return (String(parts[2]), CGPoint(x: x, y: y))
+            }
+            // Footprint around an icon's position, including its label. It's sized to cover the icon whether Finder
+            // reports its center or its top-left corner, so a moved icon always ends up clear of the dock.
+            let left = size / 2 + 30, right = size + 30, top = size / 2 + 6, bottom = size + 36, gap = 8.0
+            let footprint = { (p: CGPoint) in NSRect(x: p.x - left, y: p.y - top, width: left + right, height: top + bottom) }
+            var moves: [(String, CGPoint)] = []
+            for i in icons.indices {
+                var p = icons[i].p
+                guard let (edge, strip) = strips.first(where: { $0.1.intersects(footprint(p)) }) else { continue }
+                switch edge {
+                case .left: p.x = strip.maxX + left + gap
+                case .right: p.x = strip.minX - right - gap
+                case .bottom: p.y = strip.minY - bottom - gap
+                case .top: p.y = strip.maxY + top + gap
+                case .free: continue
+                }
+                // Step along the edge until the spot is free of other icons.
+                let step = (edge == .left || edge == .right) ? CGPoint(x: 0, y: top + bottom + 4) : CGPoint(x: left + right + 4, y: 0)
+                for _ in 0..<20 {
+                    let f = footprint(p).insetBy(dx: 6, dy: 6)
+                    let clash = icons.indices.contains { $0 != i && footprint(icons[$0].p).insetBy(dx: 6, dy: 6).intersects(f) }
+                    if !clash { break }
+                    p.x += edge == .right ? -step.x : step.x
+                    p.y += edge == .bottom ? -step.y : step.y
+                }
+                icons[i].p = p
+                moves.append((icons[i].name, p))
+            }
+            if !moves.isEmpty {
+                let esc = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+                let body = moves.map { "try\nset desktop position of item \"\(esc($0.0))\" of desktop to {\(Int($0.1.x)), \(Int($0.1.y))}\nend try" }
+                _ = self.osascript("tell application \"Finder\"\n" + body.joined(separator: "\n") + "\nend tell")
+            }
+            DispatchQueue.main.async { self.busy = false }
+        }
+    }
+}
+
 // MARK: - Dock window (one per screen)
 
 final class DockPanel: NSPanel {
@@ -1543,11 +1886,11 @@ final class Dock {
     func refresh(animated: Bool) {
         let store = Store.shared
         let p = store.placement(for: screenID)
-        panel.level = store.alwaysOnTop || store.dockMode ? .floating : .normal
+        panel.level = store.alwaysOnTop(for: screenID) || store.dockMode(for: screenID) ? .floating : .normal
         let vf = screen.visibleFrame
-        view.configure(items: store.items, running: store.showRunning ? AppController.shared.runningExtras() : [],
-                       size: store.iconSize, spacing: store.spacing, locked: store.locked,
-                       showTrash: store.showTrash, trashFull: AppController.shared.trashFull,
+        view.configure(items: store.items, running: store.showRunning(for: screenID) ? AppController.shared.runningExtras() : [],
+                       size: store.iconSize(for: screenID), spacing: store.spacing(for: screenID), locked: store.locked(for: screenID),
+                       showTrash: store.showTrash(for: screenID), trashFull: AppController.shared.trashFull,
                        vertical: p.isVertical, edge: p.edge,
                        maxLength: (p.isVertical ? vf.height : vf.width) - 2 * kMargin,
                        runningPaths: AppController.shared.running)
@@ -1729,6 +2072,268 @@ enum SystemDock {
         }
         d.removeObject(forKey: savedKey)
         run("/usr/bin/killall", ["Dock"])
+    }
+}
+
+// MARK: - Updates (GitHub Releases)
+
+struct ReleaseInfo {
+    let version: String
+    let notes: String
+    let zipURL: URL?
+    let pageURL: URL
+}
+
+struct UpdateError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
+/// Compares dotted version strings numerically ("1.10.0" > "1.9.2").
+func compareVersions(_ a: String, _ b: String) -> ComparisonResult {
+    let pa = a.split(separator: ".").map { Int($0) ?? 0 }, pb = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0, y = i < pb.count ? pb[i] : 0
+        if x != y { return x < y ? .orderedAscending : .orderedDescending }
+    }
+    return .orderedSame
+}
+
+@discardableResult
+func runTool(_ path: String, _ args: [String]) throws -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try p.run()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { throw UpdateError("\(URL(fileURLWithPath: path).lastPathComponent) failed (\(p.terminationStatus)).") }
+    return p.terminationStatus
+}
+
+/// Checks GitHub for a newer release; installs it in place and relaunches.
+/// An update is installed only if it's signed with the same certificate as the running app.
+final class Updater {
+    static let shared = Updater()
+    static let repo = "cyber-qais/qais-mac-dock"
+    private(set) var available: ReleaseInfo?
+    private var remindedThisSession: String?
+    private var timer: Timer?
+    private var progress: NSPanel?
+
+    var currentVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+
+    /// "updateFeedURL" overrides the GitHub API URL (used for testing).
+    private var feedURL: URL {
+        if let s = UserDefaults.standard.string(forKey: "updateFeedURL"), let u = URL(string: s) { return u }
+        return URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!
+    }
+
+    func start() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            if Store.shared.autoCheckUpdates { self?.check(userInitiated: false) }
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            let last = UserDefaults.standard.object(forKey: "lastUpdateCheck") as? Date ?? .distantPast
+            if Store.shared.autoCheckUpdates && Date().timeIntervalSince(last) > 24 * 3600 { self?.check(userInitiated: false) }
+        }
+    }
+
+    func check(userInitiated: Bool) {
+        var req = URLRequest(url: feedURL, timeoutInterval: 20)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("Q-Dock/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            let info = data.flatMap(Self.parse)
+            DispatchQueue.main.async { self.handle(info, error: error, userInitiated: userInitiated) }
+        }.resume()
+    }
+
+    static func parse(_ data: Data) -> ReleaseInfo? {
+        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = j["tag_name"] as? String,
+              let page = (j["html_url"] as? String).flatMap(URL.init(string:)) else { return nil }
+        let assets = j["assets"] as? [[String: Any]] ?? []
+        let zip = assets.first { ($0["name"] as? String) == "Q-Dock.zip" }?["browser_download_url"] as? String
+        return ReleaseInfo(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag,
+                           notes: j["body"] as? String ?? "",
+                           zipURL: zip.flatMap(URL.init(string:)), pageURL: page)
+    }
+
+    private func handle(_ info: ReleaseInfo?, error: Error?, userInitiated: Bool) {
+        UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+        guard let info else {
+            if userInitiated {
+                message("Couldn't check for updates", error?.localizedDescription ?? "GitHub didn't return release information. Try again later.")
+            }
+            return
+        }
+        guard compareVersions(info.version, currentVersion) == .orderedDescending else {
+            available = nil
+            if userInitiated { message("You're up to date", "Q-Dock \(currentVersion) is the latest version.") }
+            return
+        }
+        available = info
+        #if UPDATE_SELFTEST
+        install(info)  // test builds only (swiftc -D UPDATE_SELFTEST): skip the prompt
+        return
+        #endif
+        if !userInitiated && (Store.shared.skippedVersion == info.version || remindedThisSession == info.version) { return }
+        remindedThisSession = info.version
+        prompt(info)
+    }
+
+    private func message(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.runModal()
+    }
+
+    /// Release notes are Markdown; show them as readable plain text.
+    private func plainNotes(_ md: String) -> String {
+        var s = md.replacingOccurrences(of: "\r\n", with: "\n")
+        for (pattern, template) in [("(?m)^#{1,6}\\s*", ""), ("\\*\\*(.+?)\\*\\*", "$1"), ("`{3}[a-z]*\\n?", ""), ("`(.+?)`", "$1"),
+                                    ("(?m)^\\s*[-*]\\s+", "• "), ("\\[(.+?)\\]\\((.+?)\\)", "$1")] {
+            s = s.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func prompt(_ info: ReleaseInfo) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Q-Dock \(info.version) is available"
+        a.informativeText = "You have \(currentVersion). Update now? Q-Dock will restart, and your settings stay as they are."
+        let notes = plainNotes(info.notes)
+        if !notes.isEmpty {
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 440, height: 200))
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            let tv = NSTextView(frame: scroll.bounds)
+            tv.isEditable = false
+            tv.font = .systemFont(ofSize: 12)
+            tv.textContainerInset = NSSize(width: 6, height: 6)
+            tv.string = notes
+            tv.autoresizingMask = [.width]
+            scroll.documentView = tv
+            a.accessoryView = scroll
+        }
+        a.addButton(withTitle: "Update & Restart")
+        a.addButton(withTitle: "Later")
+        a.addButton(withTitle: "Skip This Version")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: install(info)
+        case .alertThirdButtonReturn: Store.shared.skippedVersion = info.version
+        default: break
+        }
+    }
+
+    func install(_ info: ReleaseInfo) {
+        let fm = FileManager.default
+        let app = Bundle.main.bundleURL
+        guard let zip = info.zipURL,
+              fm.isWritableFile(atPath: app.deletingLastPathComponent().path), fm.isWritableFile(atPath: app.path),
+              let work = try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: app, create: true) else {
+            // Can't replace the app in place (e.g. no write access): hand off to the download page.
+            NSWorkspace.shared.open(info.pageURL)
+            return
+        }
+        showProgress("Downloading Q-Dock \(info.version)…")
+        URLSession.shared.downloadTask(with: zip) { tmp, _, error in
+            let result: Result<URL, Error>
+            do {
+                guard let tmp else { throw error ?? UpdateError("The download failed.") }
+                let zipPath = work.appendingPathComponent("Q-Dock.zip")
+                try? fm.removeItem(at: zipPath)
+                try fm.moveItem(at: tmp, to: zipPath)
+                try runTool("/usr/bin/ditto", ["-x", "-k", zipPath.path, work.path])
+                let newApp = work.appendingPathComponent("Q-Dock.app")
+                try Self.verify(newApp, version: info.version)
+                result = .success(newApp)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async { self.finish(result, info: info, work: work) }
+        }.resume()
+    }
+
+    /// The new app must be Q-Dock, the advertised version, and satisfy this app's own designated requirement
+    /// (same bundle ID and signing certificate). Ad-hoc builds can't be verified, so they never self-update.
+    static func verify(_ newApp: URL, version: String) throws {
+        guard let b = Bundle(url: newApp), b.bundleIdentifier == Bundle.main.bundleIdentifier else {
+            throw UpdateError("The download doesn't contain Q-Dock.")
+        }
+        guard (b.infoDictionary?["CFBundleShortVersionString"] as? String) == version else {
+            throw UpdateError("The download's version doesn't match the release.")
+        }
+        var me: SecCode?, meStatic: SecStaticCode?, req: SecRequirement?, candidate: SecStaticCode?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyStaticCode(me, [], &meStatic) == errSecSuccess, let meStatic,
+              SecCodeCopyDesignatedRequirement(meStatic, [], &req) == errSecSuccess, let req,
+              SecStaticCodeCreateWithPath(newApp as CFURL, [], &candidate) == errSecSuccess, let candidate else {
+            throw UpdateError("Couldn't read the code signatures.")
+        }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate)
+        guard SecStaticCodeCheckValidity(candidate, flags, req) == errSecSuccess else {
+            throw UpdateError("The update isn't signed with Q-Dock's certificate, so it wasn't installed.")
+        }
+    }
+
+    private func finish(_ result: Result<URL, Error>, info: ReleaseInfo, work: URL) {
+        hideProgress()
+        do {
+            let newApp = try result.get()
+            let app = Bundle.main.bundleURL
+            _ = try FileManager.default.replaceItemAt(app, withItemAt: newApp)
+            try? runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+            try? FileManager.default.removeItem(at: work)
+            relaunch(app)
+        } catch {
+            try? FileManager.default.removeItem(at: work)
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Couldn't install the update"
+            a.informativeText = "\(error.localizedDescription)\n\nYou can download Q-Dock \(info.version) from GitHub instead."
+            a.addButton(withTitle: "Open Download Page")
+            a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(info.pageURL) }
+        }
+    }
+
+    /// Waits for this process to exit, then reopens the (now updated) app.
+    private func relaunch(_ app: URL) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$0\"", app.path]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+
+    private func showProgress(_ text: String) {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 86), styleMask: [.titled], backing: .buffered, defer: false)
+        p.title = "Updating Q-Dock"
+        p.isReleasedWhenClosed = false
+        let label = NSTextField(labelWithString: text)
+        label.frame = NSRect(x: 20, y: 48, width: 280, height: 18)
+        let bar = NSProgressIndicator(frame: NSRect(x: 20, y: 20, width: 280, height: 20))
+        bar.style = .bar
+        bar.isIndeterminate = true
+        bar.startAnimation(nil)
+        p.contentView?.addSubview(label)
+        p.contentView?.addSubview(bar)
+        p.center()
+        NSApp.activate(ignoringOtherApps: true)
+        p.makeKeyAndOrderFront(nil)
+        progress = p
+    }
+
+    private func hideProgress() {
+        progress?.orderOut(nil)
+        progress = nil
     }
 }
 
@@ -2031,7 +2636,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 self.updateRunning()
-                if self.store.showRunning { self.rebuild(animated: true) }
+                if self.docks.values.contains(where: { self.store.showRunning(for: $0.screenID) }) { self.rebuild(animated: true) }
             }
         }
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.updateTrash() }
@@ -2043,12 +2648,13 @@ final class AppController: NSObject, NSApplicationDelegate {
             self.menuDepth = max(0, self.menuDepth - 1)
         }
         registerAutoHideHotKey()
+        Updater.shared.start()
         trashFull = trashIsFull()
         updateRunning()
         rebuild(animated: false)
         if store.hideSystemDock { SystemDock.hide() }
         Onboarding.shared.showIfNeeded()
-        if UserDefaults.standard.bool(forKey: "onboarded") && store.dockMode && !AXIsProcessTrusted() {
+        if UserDefaults.standard.bool(forKey: "onboarded") && anyDockMode && !AXIsProcessTrusted() {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self, !AXIsProcessTrusted() else { return }
                 self.explainAccessibility()
@@ -2129,6 +2735,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             d.refresh(animated: animated)
         }
         DockMode.shared.update()
+        DesktopGuard.shared.update()
         updateAutoHideTimer()
     }
 
@@ -2191,15 +2798,23 @@ final class AppController: NSObject, NSApplicationDelegate {
     func dockMenu(screenID: String?) -> NSMenu {
         let m = NSMenu()
         m.autoenablesItems = false
+        if let update = Updater.shared.available {
+            m.addItem(ActionItem("⬆️ Update to Q-Dock \(update.version)…") { Updater.shared.prompt(update) })
+            m.addItem(.separator())
+        }
         m.addItem(ActionItem("Add Apps or Files…") { [weak self] in self?.addItems() })
+        m.addItem(submenuItem("Add Separator or Spacer", decorationMenu(after: nil)))
         m.addItem(.separator())
 
-        let locked = store.locked
-        let current = store.placement(for: screenID ?? NSScreen.screens.first?.stableID ?? "*")
+        // Settings for one screen (dock right-click) or every screen (menu-bar icon).
+        let sid = screenID
+        m.addItem(.sectionHeader(title: sid == nil ? "All Screens" : "This Screen"))
+        let locked = store.locked(for: sid)
+        let current = store.placement(for: sid ?? NSScreen.screens.first?.stableID ?? "*")
         let pos = NSMenu()
         pos.autoenablesItems = false
         for (e, name) in [(Edge.left, "Left Edge"), (.right, "Right Edge"), (.top, "Top Edge"), (.bottom, "Bottom Edge"), (.free, "Floating")] {
-            pos.addItem(ActionItem(name, checked: current.edge == e, enabled: !locked) { [weak self] in self?.setEdge(e, screenID: screenID) })
+            pos.addItem(ActionItem(name, checked: current.edge == e, enabled: !locked) { [weak self] in self?.setEdge(e, screenID: sid) })
         }
         if current.edge == .free {
             pos.addItem(.separator())
@@ -2207,62 +2822,78 @@ final class AppController: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 var p = current
                 p.vertical.toggle()
-                self.store.setPlacement(p, for: screenID.map { [$0] } ?? NSScreen.screens.map(\.stableID))
+                self.store.setPlacement(p, for: sid.map { [$0] } ?? NSScreen.screens.map(\.stableID))
             })
         }
-        m.addItem(submenuItem(screenID == nil ? "Position (all screens)" : "Position (this screen)", pos))
+        m.addItem(submenuItem("Position", pos))
 
+        let size = store.iconSize(for: sid)
         let sizes = NSMenu()
         for (v, name) in [(28, "Tiny"), (32, "Small"), (40, "Medium-Small"), (48, "Medium"), (56, "Medium-Large"), (64, "Large"), (80, "Huge")] {
-            sizes.addItem(ActionItem(name, checked: Int(store.iconSize) == v) { [weak self] in self?.store.iconSize = CGFloat(v) })
+            sizes.addItem(ActionItem(name, checked: Int(size) == v) { [weak self] in self?.store.setPerScreen("iconSize", Double(v), screen: sid) })
         }
         m.addItem(submenuItem("Icon Size", sizes))
-
+        let gap = store.spacing(for: sid)
         let gaps = NSMenu()
         for (v, name) in [(0, "Tight"), (2, "Compact"), (6, "Normal"), (12, "Roomy")] {
-            gaps.addItem(ActionItem(name, checked: Int(store.spacing) == v) { [weak self] in self?.store.spacing = CGFloat(v) })
+            gaps.addItem(ActionItem(name, checked: Int(gap) == v) { [weak self] in self?.store.setPerScreen("spacing", Double(v), screen: sid) })
         }
         m.addItem(submenuItem("Icon Spacing", gaps))
 
-        m.addItem(.separator())
-        m.addItem(ActionItem("Lock Position", checked: locked) { [weak self] in self?.store.locked.toggle() })
-        let hideIDs = screenID.map { [$0] } ?? NSScreen.screens.map(\.stableID)
+        m.addItem(ActionItem("Lock Position", checked: locked) { [weak self] in self?.store.setPerScreen("locked", !locked, screen: sid) })
+        let hideIDs = sid.map { [$0] } ?? NSScreen.screens.map(\.stableID)
         let hideOn = hideIDs.allSatisfy { store.autoHide(for: $0) }
-        let floating = screenID.map { store.placement(for: $0).edge == .free } ?? false
-        let hideTitle = floating ? "Auto-Hide (pin to an edge to use)"
-                                 : (screenID == nil ? "Auto-Hide (all screens)" : "Auto-Hide (this screen)")
-        let hideItem = ActionItem(hideTitle, checked: hideOn && !floating, enabled: !floating) { [weak self] in
-            self?.store.setAutoHide(!hideOn, for: hideIDs)
+        let floating = sid.map { store.placement(for: $0).edge == .free } ?? false
+        let hideItem = ActionItem(floating ? "Auto-Hide (pin to an edge to use)" : "Auto-Hide", checked: hideOn && !floating, enabled: !floating) {
+            [weak self] in self?.store.setAutoHide(!hideOn, for: hideIDs)
         }
-        if screenID != nil {
+        if sid != nil {
             hideItem.keyEquivalent = "d"
             hideItem.keyEquivalentModifierMask = [.control, .option]
         }
         m.addItem(hideItem)
-        m.addItem(ActionItem("Dock Mode (keep windows out from behind)", checked: store.dockMode) { [weak self] in
-            self?.toggleDockMode()
+        let dockModeOn = store.dockMode(for: sid)
+        m.addItem(ActionItem("Dock Mode (keep windows out from behind)", checked: dockModeOn) { [weak self] in
+            self?.toggleDockMode(screenID: sid)
         })
-        if store.dockMode && !AXIsProcessTrusted() {
+        if anyDockMode && !AXIsProcessTrusted() {
             m.addItem(ActionItem("⚠️ Dock Mode needs Accessibility access — Fix…") { [weak self] in self?.explainAccessibility() })
         }
+        if anyDockMode && DesktopGuard.shared.automationDenied {
+            m.addItem(ActionItem("⚠️ Allow Q-Dock to control Finder to keep desktop icons clear — Fix…") {
+                openPrivacyPane("Privacy_Automation")
+                DesktopGuard.shared.retry()
+            })
+        }
+        let onTop = store.alwaysOnTop(for: sid)
+        m.addItem(ActionItem("Keep Above Other Windows", checked: onTop || dockModeOn, enabled: !dockModeOn) { [weak self] in
+            self?.store.setPerScreen("alwaysOnTop", !onTop, screen: sid)
+        })
+        let running = store.showRunning(for: sid), trash = store.showTrash(for: sid)
+        m.addItem(ActionItem("Show Running Apps", checked: running) { [weak self] in self?.store.setPerScreen("showRunning", !running, screen: sid) })
+        m.addItem(ActionItem("Show Trash", checked: trash) { [weak self] in self?.store.setPerScreen("showTrash", !trash, screen: sid) })
+        if let sid, store.hasOwnSettings(sid) {
+            m.addItem(ActionItem("Use Shared Settings on This Screen") { [weak self] in self?.store.clearOwnSettings(sid) })
+        }
+
+        m.addItem(.separator())
+        m.addItem(.sectionHeader(title: "Q-Dock"))
         m.addItem(ActionItem("Hide macOS Dock", checked: store.hideSystemDock) { [weak self] in
             guard let self else { return }
             self.setHideSystemDock(!self.store.hideSystemDock)
         })
         m.addItem(ActionItem("Bring Back macOS Dock When Q-Dock Quits", checked: store.restoreSystemDockOnQuit,
                              enabled: store.hideSystemDock) { [weak self] in self?.store.restoreSystemDockOnQuit.toggle() })
-        m.addItem(ActionItem("Keep Above Other Windows", checked: store.alwaysOnTop || store.dockMode, enabled: !store.dockMode) {
-            [weak self] in self?.store.alwaysOnTop.toggle()
-        })
-        m.addItem(ActionItem("Show Running Apps", checked: store.showRunning) { [weak self] in self?.store.showRunning.toggle() })
-        m.addItem(ActionItem("Show Trash", checked: store.showTrash) { [weak self] in self?.store.showTrash.toggle() })
-        m.addItem(.separator())
         m.addItem(ActionItem("Show on All Screens", checked: store.allScreens) { [weak self] in self?.store.allScreens.toggle() })
         m.addItem(ActionItem("Same Position on Every Screen", checked: store.syncPositions) { [weak self] in self?.store.syncPositions.toggle() })
         m.addItem(ActionItem("Launch at Login", checked: SMAppService.mainApp.status == .enabled) { self.toggleLoginItem() })
         m.addItem(.separator())
         m.addItem(ActionItem("Setup Assistant…") { Onboarding.shared.show() })
-        m.addItem(ActionItem("Quit Q-Dock", key: "q") { NSApp.terminate(nil) })
+        m.addItem(ActionItem("Check for Updates…") { Updater.shared.check(userInitiated: true) })
+        m.addItem(ActionItem("Check for Updates Automatically", checked: store.autoCheckUpdates) { [weak self] in
+            self?.store.autoCheckUpdates.toggle()
+        })
+        m.addItem(ActionItem("Quit Q-Dock (\(Updater.shared.currentVersion))", key: "q") { NSApp.terminate(nil) })
         return m
     }
 
@@ -2283,8 +2914,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    func toggleDockMode() {
-        if !store.dockMode && !AXIsProcessTrusted() {
+    var anyDockMode: Bool { docks.values.contains { store.dockMode(for: $0.screenID) } }
+
+    func toggleDockMode(screenID: String?) {
+        let on = store.dockMode(for: screenID)
+        if !on && !AXIsProcessTrusted() {
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "Dock Mode needs Accessibility access"
@@ -2292,7 +2926,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 + "Allow Q-Dock in System Settings → Privacy & Security → Accessibility. Dock Mode starts working as soon as it's allowed."
             a.runModal()
         }
-        store.dockMode.toggle()
+        store.setPerScreen("dockMode", !on, screen: screenID)
     }
 
     @objc func statusClicked() {
