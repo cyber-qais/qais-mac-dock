@@ -79,6 +79,11 @@ final class Store {
     /// What clicking the app you're already in cycles through, besides its windows on this desktop.
     var cycleOtherDesktops: Bool { get { bool("cycleOtherDesktops", true) } set { d.set(newValue, forKey: "cycleOtherDesktops") } }
     var cycleMinimized: Bool { get { bool("cycleMinimized", false) } set { d.set(newValue, forKey: "cycleMinimized") } }
+    /// Clicking an app whose only window is minimized restores it (true) or opens a new window (false).
+    var restoreOnlyMinimized: Bool {
+        get { bool("restoreOnlyMinimized", true) }
+        set { d.set(newValue, forKey: "restoreOnlyMinimized") }
+    }
     var askedSystemDock: Bool { get { bool("askedSystemDock", false) } set { d.set(newValue, forKey: "askedSystemDock") } }
 
     private var placements: [String: Placement] {
@@ -608,9 +613,7 @@ final class IconView: NSView {
         } else if isFolder && Store.shared.stackStyle(for: url) != .folder {
             StackController.shared.toggle(self, event: event)
         } else if kind == .running || url.pathExtension == "app" {
-            // Clicking the app you're already in brings its next window forward.
-            if let app = runningApp, app.isActive || NSWorkspace.shared.frontmostApplication == app,
-               NativeDock.shared.cycleWindows(app) { return }
+            if let app = runningApp, NativeDock.shared.click(app) { return }
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         } else {
             NSWorkspace.shared.open(url)
@@ -2342,6 +2345,43 @@ final class NativeDock {
         return out
     }
 
+    /// Clicking a running app's icon: if its only window is minimized, restore it (or open a new one, per the
+    /// setting); if you're already in the app, bring its next window forward. False to open the app normally.
+    func click(_ app: NSRunningApplication) -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let pid = app.processIdentifier
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.3)
+        var seen = Set<CGWindowID>()
+        let wins = ((Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? []) + (scanned[pid]?.windows ?? Self.scanWindows(pid)))
+            .filter { Self.isAppWindow($0) && Self.windowID($0).map { seen.insert($0).inserted } == true }
+        if wins.count == 1, Self.isMinimized(wins[0]) {
+            if Store.shared.restoreOnlyMinimized {
+                Self.focus(wins[0], of: app)
+                return true
+            }
+            if Self.openNewWindow(app) { return true }
+        }
+        let frontmost = app.isActive || NSWorkspace.shared.frontmostApplication == app
+        return frontmost && cycleWindows(app)
+    }
+
+    /// Opens a new window by pressing the app's ⌘N menu item (File ▸ New Window in most apps).
+    private static func openNewWindow(_ app: NSRunningApplication) -> Bool {
+        if app.isHidden { app.unhide() }
+        for top in menuBarMenus(app.processIdentifier) {
+            guard let menu = children(top).first(where: { role($0) == kAXMenuRole }) else { continue }
+            for item in children(menu) where (attr(item, kAXMenuItemCmdCharAttribute) as? String) == "N"
+                && (attr(item, kAXMenuItemCmdModifiersAttribute) as? Int) == 0   // ⌘ alone
+                && (attr(item, kAXEnabledAttribute) as? Bool) != false {
+                app.activate()
+                AXUIElementPerformAction(item, kAXPressAction as CFString)
+                return true
+            }
+        }
+        return false
+    }
+
     /// Brings the app's next window forward, so repeated clicks go through all of them in a steady order: its
     /// windows on this desktop, plus (per the settings) those on other desktops and minimized ones.
     /// False when there's nothing else to switch to.
@@ -2392,6 +2432,7 @@ final class NativeDock {
     /// If it's on another desktop, macOS switches there. Uses the window server calls window switchers rely on
     /// (looked up at runtime); falls back to activating the app.
     static func focus(_ w: AXUIElement, of app: NSRunningApplication) {
+        if app.isHidden { app.unhide() }
         if isMinimized(w) { AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
         var psn = ProcessSerialNumber()
         if let id = windowID(w), let sl = skyLight,
@@ -3570,13 +3611,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         })
         m.addItem(ActionItem("Bring Back macOS Dock When Q-Dock Quits", checked: store.restoreSystemDockOnQuit,
                              enabled: store.hideSystemDock) { [weak self] in self?.store.restoreSystemDockOnQuit.toggle() })
-        let cycle = NSMenu()
-        cycle.addItem(ActionItem("Windows on This Desktop", checked: true, enabled: false) {})
-        cycle.addItem(ActionItem("Windows on Other Desktops", checked: store.cycleOtherDesktops) { [weak self] in
+        let click = NSMenu()
+        click.autoenablesItems = false
+        click.addItem(.sectionHeader(title: "Cycle Through Its"))
+        click.addItem(ActionItem("Windows on This Desktop", checked: true, enabled: false) {})
+        click.addItem(ActionItem("Windows on Other Desktops", checked: store.cycleOtherDesktops) { [weak self] in
             self?.store.cycleOtherDesktops.toggle()
         })
-        cycle.addItem(ActionItem("Minimized Windows", checked: store.cycleMinimized) { [weak self] in self?.store.cycleMinimized.toggle() })
-        m.addItem(submenuItem("Clicking an Open App Cycles Through", cycle))
+        click.addItem(ActionItem("Minimized Windows", checked: store.cycleMinimized) { [weak self] in self?.store.cycleMinimized.toggle() })
+        click.addItem(.separator())
+        click.addItem(.sectionHeader(title: "If Its Only Window Is Minimized"))
+        click.addItem(ActionItem("Restore That Window", checked: store.restoreOnlyMinimized) { [weak self] in
+            self?.store.restoreOnlyMinimized = true
+        })
+        click.addItem(ActionItem("Open a New Window", checked: !store.restoreOnlyMinimized) { [weak self] in
+            self?.store.restoreOnlyMinimized = false
+        })
+        m.addItem(submenuItem("Clicking an Open App", click))
         m.addItem(ActionItem("Show on All Screens", checked: store.allScreens) { [weak self] in self?.store.allScreens.toggle() })
         m.addItem(ActionItem("Same Position on Every Screen", checked: store.syncPositions) { [weak self] in self?.store.syncPositions.toggle() })
         m.addItem(ActionItem("Launch at Login", checked: SMAppService.mainApp.status == .enabled) { self.toggleLoginItem() })
