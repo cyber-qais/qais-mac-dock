@@ -574,7 +574,10 @@ final class IconView: NSView {
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseEntered(with e: NSEvent) { if !isDecoration { dock?.hover(self, inside: true) } }
+    override func mouseEntered(with e: NSEvent) {
+        if !isDecoration { dock?.hover(self, inside: true) }
+        if url.pathExtension == "app", let app = runningApp { NativeDock.shared.prefetchWindows(app) }
+    }
     override func mouseExited(with e: NSEvent) { if !isDecoration { dock?.hover(self, inside: false) } }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -687,12 +690,12 @@ final class IconView: NSView {
         }
         m.addItem(NSMenuItem(title: displayName, action: nil, keyEquivalent: ""))
         m.addItem(.separator())
-        // The app's own Dock menu (windows, recent documents, "New Incognito Window", …), copied from the macOS Dock.
-        if kind != .trash && url.pathExtension == "app", let native = NativeDock.shared.appMenu(for: url), !native.items.isEmpty {
-            let items = native.items
-            native.removeAllItems()
-            items.forEach { m.addItem($0) }
-            m.addItem(.separator())
+        // The app's windows and its own Dock menu commands ("New Incognito Window", profiles, …).
+        if kind != .trash && url.pathExtension == "app", let app = runningApp {
+            for sec in NativeDock.shared.appMenuItems(for: app) {
+                sec.forEach { m.addItem($0) }
+                m.addItem(.separator())
+            }
         }
         if kind == .trash {
             m.addItem(ActionItem("Open") { NSWorkspace.shared.open(trashURL) })
@@ -2136,9 +2139,242 @@ final class NativeDock {
     }
 
     // MARK: App menus
+    //
+    // An app's own Dock menu (Chrome's profiles, New Window, New Incognito Window, …) is only available from the
+    // macOS Dock, and the Dock draws the menu on screen whenever it's asked for it. So Q-Dock never asks while you
+    // can see it: it copies each running app's menu while the screen is locked or asleep, and right-click menus are
+    // built instantly from that copy plus the app's current windows (read from the app itself).
+    // Picking a copied command presses the same-named item in the app's menu bar, which is invisible; only if the
+    // app's menu bar has no such item is the Dock's menu reopened to press it.
 
-    /// Opens the app's menu in the macOS Dock, reads it, and closes it again. The Dock keeps the menu out of sight
-    /// while it's hidden; if the menu doesn't show up quickly, give up rather than stall the right-click.
+    struct MenuEntry: Codable {
+        var title: String
+        var enabled = true
+        var checked = false
+        var header = false
+        var children: [[MenuEntry]]?
+    }
+
+    private static let cacheKey = "appMenuCache"
+    private lazy var cache: [String: [[MenuEntry]]] = {
+        guard let data = UserDefaults.standard.data(forKey: Self.cacheKey),
+              let c = try? JSONDecoder().decode([String: [[MenuEntry]]].self, from: data) else { return [:] }
+        return c
+    }()
+    private var screenHidden = false
+    private var refreshing = false
+
+    func observeScreen() {
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.screenDidHide() }
+        dnc.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.screenHidden = false }
+        let wnc = NSWorkspace.shared.notificationCenter
+        wnc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.screenDidHide() }
+        wnc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.screenHidden = false }
+    }
+
+    private func screenDidHide() {
+        screenHidden = true
+        // Give the lock screen a moment to cover everything.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.refreshMenus() }
+    }
+
+    /// Copies the Dock menu of every running app, one at a time, while the screen stays hidden.
+    func refreshMenus() {
+        guard screenHidden, !refreshing, AXIsProcessTrusted() else { return }
+        refreshing = true
+        var queue = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != getpid() && $0.bundleIdentifier != nil && $0.bundleURL != nil
+        }
+        func next() {
+            guard screenHidden, !queue.isEmpty else {
+                refreshing = false
+                if let data = try? JSONEncoder().encode(cache) { UserDefaults.standard.set(data, forKey: Self.cacheKey) }
+                return
+            }
+            let app = queue.removeFirst()
+            if let entries = fetchCommands(app) { cache[app.bundleIdentifier!] = entries }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { next() }
+        }
+        next()
+    }
+
+    /// The app's own sections of its Dock menu, without its windows (Q-Dock lists those live) and without the
+    /// Dock's standard last sections (Options ▸ … / Show All Windows, Hide, Quit), which Q-Dock has its own versions of.
+    private func fetchCommands(_ app: NSRunningApplication) -> [[MenuEntry]]? {
+        guard let url = app.bundleURL else { return nil }
+        let windows = Set(Self.allWindows(of: app).map { Self.windowTitle($0, app: app) })
+        let topMenus = Set(Self.menuBarMenus(app.processIdentifier).compactMap { Self.attr($0, kAXTitleAttribute) as? String })
+        return withOpenMenu(url) { menu in
+            var secs = sections(menu)
+            if !secs.isEmpty { secs.removeLast() }
+            if let last = secs.last, last.count == 1, submenu(last[0]) != nil { secs.removeLast() }
+            // Drop the window list (Q-Dock lists windows live): its current window is checked, and its titles
+            // are the app's window titles.
+            return secs.map { $0.map { entry($0, topMenus: topMenus) } }
+                .filter { sec in !sec.contains { e in e.checked || windows.contains(e.title) } }
+        }
+    }
+
+    private func entry(_ e: AXUIElement, topMenus: Set<String>) -> MenuEntry {
+        let title = Self.attr(e, kAXTitleAttribute) as? String ?? ""
+        var m = MenuEntry(title: title)
+        m.enabled = Self.attr(e, kAXEnabledAttribute) as? Bool ?? true
+        m.checked = !((Self.attr(e, kAXMenuItemMarkCharAttribute) as? String) ?? "").isEmpty
+        if let sub = submenu(e) {
+            m.children = sections(sub).map { $0.map { entry($0, topMenus: topMenus) } }
+        } else {
+            // Section titles like Chrome's "Profiles" match one of the app's menu-bar menus and do nothing when chosen.
+            m.header = topMenus.contains(title)
+        }
+        return m
+    }
+
+    /// Items for the right-click menu of a running app: its windows, then its own commands. Instant; no Dock menu.
+    func appMenuItems(for app: NSRunningApplication) -> [[NSMenuItem]] {
+        var out: [[NSMenuItem]] = []
+        let wins = Self.allWindows(of: app, scanned: scanned[app.processIdentifier]?.windows ?? [])
+        if !wins.isEmpty {
+            out.append(wins.map { w in
+                let item = ActionItem(Self.windowTitle(w, app: app),
+                                      checked: app.isActive && (Self.attr(w, kAXMainAttribute) as? Bool) == true) {
+                    if (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true {
+                        AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                    }
+                    AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                    app.activate()
+                }
+                if (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true { item.state = .mixed }
+                return item
+            })
+        }
+        if let id = app.bundleIdentifier, let secs = cache[id] {
+            out += secs.map { $0.map { menuItem($0, path: [], app: app) } }
+        }
+        return out
+    }
+
+    private func menuItem(_ e: MenuEntry, path: [String], app: NSRunningApplication) -> NSMenuItem {
+        if e.header { return NSMenuItem.sectionHeader(title: e.title) }
+        let full = path + [e.title]
+        if let kids = e.children {
+            let m = NSMenu()
+            for (i, sec) in kids.enumerated() {
+                if i > 0 { m.addItem(.separator()) }
+                sec.forEach { m.addItem(menuItem($0, path: full, app: app)) }
+            }
+            return submenuItem(e.title, m)
+        }
+        return ActionItem(e.title, checked: e.checked, enabled: e.enabled) { [weak self] in self?.perform(full, app: app) }
+    }
+
+    /// Runs a copied command: through the app's menu bar if it has an item with that title, else through the Dock.
+    private func perform(_ path: [String], app: NSRunningApplication) {
+        if let title = path.last, let item = Self.menuBarItem(titled: title, in: app.processIdentifier) {
+            AXUIElementPerformAction(item, kAXPressAction as CFString)
+            app.activate()
+        } else if let url = app.bundleURL {
+            press(path, in: url)
+        }
+    }
+
+    // MARK: Windows
+
+    /// Windows found by `scanWindows`, per app.
+    private var scanned: [pid_t: (date: Date, windows: [AXUIElement])] = [:]
+    private let scanQueue = DispatchQueue(label: "qdock.windowscan", qos: .userInitiated)
+
+    /// The app's titled standard windows: the ones Accessibility lists (this desktop, plus minimized ones) and the
+    /// ones last found on other desktops.
+    private static func allWindows(of app: NSRunningApplication, scanned: [AXUIElement]? = nil) -> [AXUIElement] {
+        var out: [AXUIElement] = []
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.3)
+        let listed = attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        for w in listed + (scanned ?? scanWindows(app.processIdentifier)) where !out.contains(where: { CFEqual($0, w) }) {
+            AXUIElementSetMessagingTimeout(w, 0.1)
+            guard (attr(w, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole,
+                  !((attr(w, kAXTitleAttribute) as? String) ?? "").isEmpty else { continue }
+            out.append(w)
+        }
+        return out
+    }
+
+    /// Accessibility only lists windows on the current desktop, so look up the app's other windows by element ID
+    /// (the technique window switchers use). Takes ~50–150 ms, so it runs in the background when you hover an app.
+    private static func scanWindows(_ pid: pid_t) -> [AXUIElement] {
+        var out: [AXUIElement] = []
+        var token = Data(count: 20)
+        token.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
+        token.replaceSubrange(8..<12, with: withUnsafeBytes(of: UInt32(0x636f_636f)) { Data($0) })   // 'coco'
+        for id in UInt64(0)..<2000 {
+            token.replaceSubrange(12..<20, with: withUnsafeBytes(of: id) { Data($0) })
+            guard let el = _AXUIElementCreateWithRemoteToken(token as CFData)?.takeRetainedValue() else { continue }
+            AXUIElementSetMessagingTimeout(el, 0.05)
+            var v: AnyObject?
+            let err = AXUIElementCopyAttributeValue(el, kAXSubroleAttribute as CFString, &v)
+            if err == .cannotComplete { break }   // the app isn't responding; don't wait on every ID
+            if err == .success, (v as? String) == kAXStandardWindowSubrole { out.append(el) }
+        }
+        return out
+    }
+
+    /// Refreshes the app's window list in the background, so a right-click that follows is instant.
+    func prefetchWindows(_ app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        if let s = scanned[pid], Date().timeIntervalSince(s.date) < 2 { return }
+        scanned[pid] = (Date(), scanned[pid]?.windows ?? [])
+        scanQueue.async {
+            let wins = Self.scanWindows(pid)
+            DispatchQueue.main.async { self.scanned[pid] = (Date(), wins) }
+        }
+    }
+
+    /// Chrome and others title their windows "Page - Google Chrome - Profile"; show just the page, like the Dock.
+    private static func windowTitle(_ w: AXUIElement, app: NSRunningApplication) -> String {
+        let title = attr(w, kAXTitleAttribute) as? String ?? ""
+        if let name = app.localizedName, let r = title.range(of: " - \(name)"), r.lowerBound > title.startIndex {
+            return String(title[..<r.lowerBound])
+        }
+        return title
+    }
+
+    /// The app's menu-bar menus (File, Edit, …), without the Apple menu.
+    private static func menuBarMenus(_ pid: pid_t) -> [AXUIElement] {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        guard let bar = attr(app, kAXMenuBarAttribute) else { return [] }
+        return Array(children(bar as! AXUIElement).dropFirst())
+    }
+
+    /// The menu-bar item to press for a Dock menu command titled `title`, looking in each menu and one level of
+    /// submenus. Also matches recent items listed by path ("~/Code/site" for "site"), and for a submenu such as
+    /// Terminal's "New Window ▸", its first item (the default).
+    private static func menuBarItem(titled title: String, in pid: pid_t) -> AXUIElement? {
+        func submenu(_ item: AXUIElement) -> AXUIElement? { children(item).first { role($0) == kAXMenuRole } }
+        func enabled(_ item: AXUIElement) -> Bool { (attr(item, kAXEnabledAttribute) as? Bool) != false }
+        func search(_ menu: AXUIElement, depth: Int) -> AXUIElement? {
+            for item in children(menu) {
+                let t = attr(item, kAXTitleAttribute) as? String ?? ""
+                if t == title || t.hasSuffix("/" + title), enabled(item) {
+                    guard let sub = submenu(item) else { return item }
+                    if let first = children(sub).first(where: { !((attr($0, kAXTitleAttribute) as? String) ?? "").isEmpty && enabled($0) }),
+                       submenu(first) == nil {
+                        return first
+                    }
+                }
+                if depth > 0, let sub = submenu(item), let hit = search(sub, depth: depth - 1) { return hit }
+            }
+            return nil
+        }
+        for top in menuBarMenus(pid) {
+            guard let menu = children(top).first(where: { role($0) == kAXMenuRole }) else { continue }
+            if let hit = search(menu, depth: 1) { return hit }
+        }
+        return nil
+    }
+
+    /// Opens the app's menu in the macOS Dock and hands it to `body`, then closes it.
     private func withOpenMenu<T>(_ url: URL, _ body: (AXUIElement) -> T?) -> T? {
         guard let item = appItems()[canonicalPath(url)] else { return nil }
         AXUIElementSetMessagingTimeout(item, 0.5)
@@ -2166,40 +2402,7 @@ final class NativeDock {
 
     private func submenu(_ item: AXUIElement) -> AXUIElement? { Self.children(item).first { Self.role($0) == kAXMenuRole } }
 
-    /// Converts the Dock's menu to ours. Each item replays itself by title path, since the Dock's menu is
-    /// closed by the time you pick something. Q-Dock already offers the Dock's own last sections
-    /// (Options ▸ … / Show All Windows, Hide, Quit, or Open), so they're dropped; this keeps it locale-independent.
-    func appMenu(for url: URL) -> NSMenu? {
-        withOpenMenu(url) { menu in
-            var secs = sections(menu)
-            if !secs.isEmpty { secs.removeLast() }
-            if let last = secs.last, last.count == 1, submenu(last[0]) != nil { secs.removeLast() }
-            let m = NSMenu()
-            for (i, sec) in secs.enumerated() {
-                if i > 0 { m.addItem(.separator()) }
-                sec.forEach { m.addItem(convert($0, path: [], url: url)) }
-            }
-            return m
-        }
-    }
-
-    private func convert(_ e: AXUIElement, path: [String], url: URL) -> NSMenuItem {
-        let title = Self.attr(e, kAXTitleAttribute) as? String ?? ""
-        let full = path + [title]
-        let enabled = Self.attr(e, kAXEnabledAttribute) as? Bool ?? true
-        let mark = Self.attr(e, kAXMenuItemMarkCharAttribute) as? String ?? ""
-        if let sub = submenu(e) {
-            let m = NSMenu()
-            for (i, sec) in sections(sub).enumerated() {
-                if i > 0 { m.addItem(.separator()) }
-                sec.forEach { m.addItem(convert($0, path: full, url: url)) }
-            }
-            return submenuItem(title, m)
-        }
-        return ActionItem(title, checked: !mark.isEmpty, enabled: enabled) { [weak self] in self?.press(full, in: url) }
-    }
-
-    /// Re-opens the app's Dock menu and presses the item at `path`.
+    /// Re-opens the app's Dock menu and presses the item at `path` (fallback for commands not in the menu bar).
     private func press(_ path: [String], in url: URL) {
         _ = withOpenMenu(url) { menu -> Bool? in
             var level = menu
@@ -2214,6 +2417,10 @@ final class NativeDock {
         }
     }
 }
+
+/// Private HIServices call that makes an accessibility element from a (pid, element ID) token.
+@_silgen_name("_AXUIElementCreateWithRemoteToken")
+func _AXUIElementCreateWithRemoteToken(_ data: CFData) -> Unmanaged<AXUIElement>?
 
 // MARK: - Global hotkey (⌃⌥D toggles Auto-Hide on the screen under the pointer)
 
@@ -3026,6 +3233,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         rebuild(animated: false)
         if store.hideSystemDock { SystemDock.hide() }
         NativeDock.shared.start()
+        NativeDock.shared.observeScreen()
         Installer.offerMoveIfNeeded()
         Onboarding.shared.showIfNeeded()
         if UserDefaults.standard.bool(forKey: "onboarded") && anyDockMode && !AXIsProcessTrusted() {

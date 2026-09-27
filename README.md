@@ -44,7 +44,7 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 🙈 **Hide the macOS Dock** | Optional. Keeps the built-in Dock out of sight so only Q-Dock shows, and brings it back when Q-Dock quits if you want. |
 | 🫥 **Auto-Hide** | Per screen. The dock slides off its edge and comes back when you push the pointer against that edge. Toggle it with **⌃⌥D**. |
 | 🪟 **Dock Mode** | Keeps other windows out from behind an edge-pinned dock by nudging or resizing them. |
-| 🔴 **Badges & app menus** | Unread counts and other badges show on each icon, and right-clicking an app shows its own Dock menu (open windows, recent files, *New Incognito Window*, …). Needs Accessibility. |
+| 🔴 **Badges & app menus** | Unread counts and other badges show on each icon. Right-clicking an app lists its open windows (on every desktop) and its own Dock commands (*New Incognito Window*, profiles, recent files, …); Q-Dock learns an app's commands while your screen is locked or asleep. Needs Accessibility. |
 | 🏷️ **Instant labels** | App names appear the moment you hover, with a small genie-style magnification. |
 | 📂 **Folder stacks** | Open folders as a **Fan** or **Grid**, with previews. Drag files out, drop files in, and right-click to copy, rename or trash. |
 | ⚙️ **Running apps** | Open apps that aren't pinned show up after a separator. Drag one in to pin it. |
