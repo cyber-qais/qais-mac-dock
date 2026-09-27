@@ -490,7 +490,7 @@ final class IconView: NSView {
         imageLayer.transform = t
         let b = badgeLayer.bounds.size, r = iconRect
         badgeLayer.position = CGPoint(x: min(r.maxX - b.width / 2 + s * 0.06, r.maxX + b.width / 2 - b.height),
-                                      y: r.maxY - b.height / 2 + s * 0.06)
+                                      y: r.maxY - b.height / 2 + 2)
         CATransaction.commit()
     }
 
@@ -605,6 +605,8 @@ final class IconView: NSView {
         } else if isFolder && Store.shared.stackStyle(for: url) != .folder {
             StackController.shared.toggle(self, event: event)
         } else if kind == .running || url.pathExtension == "app" {
+            // Clicking the app you're already in brings its next window forward.
+            if let app = runningApp, app.isActive, NativeDock.shared.cycleWindows(app) { return }
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         } else {
             NSWorkspace.shared.open(url)
@@ -853,11 +855,17 @@ final class DockView: NSView {
 
     private var base: CGFloat { locked ? kPad : kPad + kHandle + sp }
     private var cellCross: CGFloat { s + kDot }
+    /// Padding across the dock: slim on the running-dot side (toward the screen edge), and on the other side just
+    /// enough room for icons to magnify on hover.
+    private var edgePad: CGFloat { 3 }
+    private var farPad: CGFloat { max(6, ceil(s * 0.13)) }
+    /// Padding before the first line: top for horizontal docks (this view is flipped), left for vertical ones.
+    private var lowPad: CGFloat { (vertical ? edge != .right : edge == .top) ? edgePad : farPad }
     private var tail: [IconView] { extras + (trash.map { [$0] } ?? []) }
     private var allViews: [IconView] { icons + tail }
     private func main(_ p: NSPoint) -> CGFloat { vertical ? p.y : p.x }
     private func pt(_ main: CGFloat, _ cross: CGFloat) -> NSPoint { vertical ? NSPoint(x: cross, y: main) : NSPoint(x: main, y: cross) }
-    private var crossLength: CGFloat { kPad * 2 + CGFloat(lineCount) * cellCross + CGFloat(lineCount - 1) * sp }
+    private var crossLength: CGFloat { edgePad + farPad + CGFloat(lineCount) * cellCross + CGFloat(lineCount - 1) * sp }
     /// The first line hugs the pinned edge; extra lines stack away from it.
     private func visualLine(_ line: Int) -> Int { (edge == .right || edge == .bottom) ? lineCount - 1 - line : line }
 
@@ -920,7 +928,7 @@ final class DockView: NSView {
         lineCount = line + 1
         mainExtent = extent + kPad
         let frames = raw.map { r -> NSRect in
-            let c = kPad + CGFloat(visualLine(r.line)) * (cellCross + sp)
+            let c = lowPad + CGFloat(visualLine(r.line)) * (cellCross + sp)
             return vertical ? NSRect(x: c, y: r.main, width: cellCross, height: r.len)
                             : NSRect(x: r.main, y: c, width: r.len, height: cellCross)
         }
@@ -950,7 +958,7 @@ final class DockView: NSView {
     /// Position in reading order: (line from the pinned edge, distance along the dock).
     private func readingKey(_ p: NSPoint) -> (Int, CGFloat) {
         let c = vertical ? p.x : p.y
-        let vl = max(0, min(lineCount - 1, Int(((c - kPad) / (cellCross + sp)).rounded(.down))))
+        let vl = max(0, min(lineCount - 1, Int(((c - lowPad) / (cellCross + sp)).rounded(.down))))
         return (visualLine(vl), main(p))
     }
     private func isBefore(_ f: NSRect, _ p: NSPoint) -> Bool {
@@ -974,7 +982,7 @@ final class DockView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         if !locked {
             NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
-            let mid = kPad + cellCross / 2 + (edge == .right || edge == .bottom ? CGFloat(lineCount - 1) * (cellCross + sp) : 0)
+            let mid = lowPad + cellCross / 2 + (edge == .right || edge == .bottom ? CGFloat(lineCount - 1) * (cellCross + sp) : 0)
             for a in [kPad + 4, kPad + 9] {
                 for b in [mid - 6, mid, mid + 6] {
                     let c = pt(a, b)
@@ -1940,13 +1948,23 @@ final class Dock {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.isReleasedWhenClosed = false
-        let fx = NSVisualEffectView()
-        fx.material = .popover
-        fx.blendingMode = .behindWindow
-        fx.state = .active
-        fx.maskImage = roundedMask(14)
-        panel.contentView = fx
-        fx.addSubview(view)
+        if #available(macOS 26.0, *) {
+            // Liquid Glass, like the macOS 26 Dock.
+            let glass = NSGlassEffectView()
+            glass.cornerRadius = 14
+            let content = NSView()
+            content.addSubview(view)
+            glass.contentView = content
+            panel.contentView = glass
+        } else {
+            let fx = NSVisualEffectView()
+            fx.material = .hudWindow
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            fx.maskImage = roundedMask(14)
+            panel.contentView = fx
+            fx.addSubview(view)
+        }
         view.dock = self
     }
 
@@ -2317,6 +2335,31 @@ final class NativeDock {
             if err == .success, (v as? String) == kAXStandardWindowSubrole { out.append(el) }
         }
         return out
+    }
+
+    /// Brings the app's backmost window on this desktop to the front, so repeated clicks go through all of them;
+    /// if every window is minimized, restores one. False when there's nothing to switch to.
+    func cycleWindows(_ app: NSRunningApplication) -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.3)
+        let wins = (Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? [])   // front to back
+            .filter { (Self.attr($0, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole }
+        let minimized = { (w: AXUIElement) in (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true }
+        let visible = wins.filter { !minimized($0) }
+        let target: AXUIElement
+        if visible.count >= 2 {
+            target = visible.last!
+        } else if visible.isEmpty, let w = wins.first(where: minimized) {
+            AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+            target = w
+        } else {
+            return false
+        }
+        AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+        app.activate()
+        return true
     }
 
     /// Refreshes the app's window list in the background, so a right-click that follows is instant.
