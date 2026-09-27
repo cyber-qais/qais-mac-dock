@@ -606,7 +606,8 @@ final class IconView: NSView {
             StackController.shared.toggle(self, event: event)
         } else if kind == .running || url.pathExtension == "app" {
             // Clicking the app you're already in brings its next window forward.
-            if let app = runningApp, app.isActive, NativeDock.shared.cycleWindows(app) { return }
+            if let app = runningApp, app.isActive || NSWorkspace.shared.frontmostApplication == app,
+               NativeDock.shared.cycleWindows(app) { return }
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         } else {
             NSWorkspace.shared.open(url)
@@ -2343,14 +2344,22 @@ final class NativeDock {
         guard AXIsProcessTrusted() else { return false }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(axApp, 0.3)
-        let wins = (Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? [])   // front to back
+        let wins = (Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? [])
             .filter { (Self.attr($0, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole }
         let minimized = { (w: AXUIElement) in (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true }
-        let visible = wins.filter { !minimized($0) }
+        // Accessibility doesn't list windows in stacking order, so take it from the window server (front to back).
+        let order = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+            .filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier && ($0[kCGWindowLayer as String] as? Int) == 0 }
+            .compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
+        let onScreen = wins.compactMap { w -> (AXUIElement, Int)? in
+            var id: CGWindowID = 0
+            guard !minimized(w), _AXUIElementGetWindow(w, &id) == .success, let z = order.firstIndex(of: id) else { return nil }
+            return (w, z)
+        }.sorted { $0.1 < $1.1 }.map(\.0)
         let target: AXUIElement
-        if visible.count >= 2 {
-            target = visible.last!
-        } else if visible.isEmpty, let w = wins.first(where: minimized) {
+        if onScreen.count >= 2 {
+            target = onScreen.last!
+        } else if onScreen.isEmpty, let w = wins.first(where: minimized) {
             AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
             target = w
         } else {
@@ -2460,6 +2469,10 @@ final class NativeDock {
         }
     }
 }
+
+/// Private HIServices call that gives a window element's window-server ID.
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 /// Private HIServices call that makes an accessibility element from a (pid, element ID) token.
 @_silgen_name("_AXUIElementCreateWithRemoteToken")
