@@ -44,6 +44,7 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 🙈 **Hide the macOS Dock** | Optional. Keeps the built-in Dock out of sight so only Q-Dock shows, and brings it back when Q-Dock quits if you want. |
 | 🫥 **Auto-Hide** | Per screen. The dock slides off its edge and comes back when you push the pointer against that edge. Toggle it with **⌃⌥D**. |
 | 🪟 **Dock Mode** | Keeps other windows out from behind an edge-pinned dock by nudging or resizing them. |
+| 🔴 **Badges & app menus** | Unread counts and other badges show on each icon, and right-clicking an app shows its own Dock menu (open windows, recent files, *New Incognito Window*, …). Needs Accessibility. |
 | 🏷️ **Instant labels** | App names appear the moment you hover, with a small genie-style magnification. |
 | 📂 **Folder stacks** | Open folders as a **Fan** or **Grid**, with previews. Drag files out, drop files in, and right-click to copy, rename or trash. |
 | ⚙️ **Running apps** | Open apps that aren't pinned show up after a separator. Drag one in to pin it. |
@@ -60,13 +61,9 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 
 1. Download **Q-Dock.zip** from the [latest release](https://github.com/cyber-qais/qais-mac-dock/releases/latest) and unzip it.
 2. Move **Q-Dock.app** into your Applications folder.
-3. Open it. Q-Dock isn't notarized by Apple, so the first time you open it, **right-click → Open**, then click
-   **Open** again (or go to System Settings → Privacy & Security → **Open Anyway**). If macOS says the app is
-   "damaged", run:
-
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/Q-Dock.app
-   ```
+3. Open it. Q-Dock is signed with a Developer ID and notarized by Apple, so it opens like any other app.
+   If you opened it from Downloads, it offers to **Move to Applications**, replacing any older copy
+   and keeping your settings.
 
 Runs on macOS 14 or later, on both Apple Silicon and Intel Macs.
 
@@ -282,7 +279,7 @@ pkill -x Q-Dock; defaults delete com.local.qdock; open ~/Applications/Q-Dock.app
 
 | Permission | Used for | Where to allow it |
 |---|---|---|
-| Accessibility | Dock Mode (moving other windows) | System Settings → Privacy & Security → Accessibility |
+| Accessibility | Dock Mode (moving other windows), badges, and apps' own right-click menus | System Settings → Privacy & Security → Accessibility |
 | Full Disk Access | The Trash full/empty icon; opening protected folders as stacks | System Settings → Privacy & Security → Full Disk Access |
 | Automation (Finder) | Keeping desktop icons clear in Dock Mode; **Empty Trash…** | macOS asks the first time it's needed |
 
@@ -300,4 +297,16 @@ tools/make-icon.swift    turns assets/icon.png into AppIcon.icns
 tools/make-signing-cert.sh  creates the local signing certificate build.sh uses
 assets/icon.png          app icon source
 docs/screenshots/        images used in this README
+```
+
+## Making a release
+
+Releases are signed with HQE Systems' **Developer ID**, notarized and stapled, so they open without Gatekeeper
+warnings. `release.sh` does all of it and leaves a `Q-Dock.zip` to attach to the GitHub release (the in-app
+updater downloads that asset). The one-time setup is described at the top of the script: install the
+*Developer ID Application* certificate, then save notarization credentials in your keychain with
+`xcrun notarytool store-credentials`.
+
+```bash
+./release.sh
 ```

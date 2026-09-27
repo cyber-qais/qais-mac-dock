@@ -27,8 +27,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Q-Dock</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2.0</string>
-  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>1.3.0</string>
+  <key>CFBundleVersion</key><string>5</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -37,14 +37,23 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Sign with the local "Q-Dock Local Signing" certificate if it exists (see tools/make-signing-cert.sh),
-# so macOS keeps permissions like Accessibility across rebuilds. Otherwise fall back to ad-hoc signing.
-IDENTITY=$(security find-identity -p codesigning 2>/dev/null | awk '/"Q-Dock Local Signing"/ {print $2; exit}')
-if [ -n "$IDENTITY" ]; then
-  codesign --force --sign "$IDENTITY" "$APP"
-  echo "Signed with Q-Dock Local Signing ($IDENTITY)"
+# Signing, in order of preference:
+#  1. QDOCK_SIGN_IDENTITY (release.sh sets this to the Developer ID certificate): hardened runtime + secure timestamp,
+#     as notarization requires.
+#  2. The local "Q-Dock Local Signing" certificate (see tools/make-signing-cert.sh), so macOS keeps permissions like
+#     Accessibility across rebuilds.
+#  3. Ad-hoc.
+if [ -n "${QDOCK_SIGN_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp --entitlements Q-Dock.entitlements --sign "$QDOCK_SIGN_IDENTITY" "$APP"
+  echo "Signed with $QDOCK_SIGN_IDENTITY (hardened runtime)"
 else
-  codesign --force --sign - "$APP"
-  echo "Signed ad-hoc (run tools/make-signing-cert.sh to keep permissions across rebuilds)"
+  IDENTITY=$(security find-identity -p codesigning 2>/dev/null | awk '/"Q-Dock Local Signing"/ {print $2; exit}')
+  if [ -n "$IDENTITY" ]; then
+    codesign --force --sign "$IDENTITY" "$APP"
+    echo "Signed with Q-Dock Local Signing ($IDENTITY)"
+  else
+    codesign --force --sign - "$APP"
+    echo "Signed ad-hoc (run tools/make-signing-cert.sh to keep permissions across rebuilds)"
+  fi
 fi
 echo "Built $(pwd)/$APP"

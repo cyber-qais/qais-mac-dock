@@ -414,8 +414,11 @@ final class IconView: NSView {
     weak var dock: DockView?
     private var image: NSImage
     private let imageLayer = CALayer()
+    private let badgeLayer = CALayer()
     private(set) var magnification: CGFloat = 1
     var running = false { didSet { if running != oldValue { needsDisplay = true } } }
+    /// The app's Dock badge ("3", "•", …), read from the macOS Dock.
+    var badge: String? { didSet { if badge != oldValue { updateBadge() } } }
     var dimmed = false { didSet { alphaValue = dimmed ? 0.3 : 1 } }
 
     init(url: URL, kind: Kind = .item, image: NSImage? = nil, size: CGFloat, dotSide: Edge) {
@@ -434,6 +437,9 @@ final class IconView: NSView {
         imageLayer.contentsGravity = .resizeAspect
         imageLayer.anchorPoint = anchor
         layer?.addSublayer(imageLayer)
+        badgeLayer.isHidden = true
+        badgeLayer.zPosition = 1
+        layer?.addSublayer(badgeLayer)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -482,12 +488,42 @@ final class IconView: NSView {
         imageLayer.transform = CATransform3DIdentity
         imageLayer.frame = iconRect.insetBy(dx: s * 0.04, dy: s * 0.04)
         imageLayer.transform = t
+        let b = badgeLayer.bounds.size, r = iconRect
+        badgeLayer.position = CGPoint(x: min(r.maxX - b.width / 2 + s * 0.06, r.maxX + b.width / 2 - b.height),
+                                      y: r.maxY - b.height / 2 + s * 0.06)
         CATransaction.commit()
+    }
+
+    private func updateBadge() {
+        guard let text = badge, !text.isEmpty else { badgeLayer.isHidden = true; return }
+        let font = NSFont.systemFont(ofSize: max(10, round(s * 0.24)), weight: .semibold)
+        let str = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: NSColor.white])
+        let ts = str.size()
+        let h = ceil(font.pointSize * 1.6), w = max(h, ceil(ts.width) + h * 0.7)
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { r in
+            NSColor.systemRed.setFill()
+            NSBezierPath(roundedRect: r, xRadius: h / 2, yRadius: h / 2).fill()
+            str.draw(at: NSPoint(x: (w - ts.width) / 2, y: (h - ts.height) / 2))
+            return true
+        }
+        let scale = window?.backingScaleFactor ?? 2
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        badgeLayer.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+        badgeLayer.contentsScale = scale
+        badgeLayer.contents = img.layerContents(forContentsScale: scale)
+        badgeLayer.shadowOpacity = 0.25
+        badgeLayer.shadowRadius = 1.5
+        badgeLayer.shadowOffset = CGSize(width: 0, height: -0.5)
+        badgeLayer.isHidden = false
+        CATransaction.commit()
+        needsLayout = true
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         updateImageContents()
+        updateBadge()
     }
 
     private func updateImageContents() {
@@ -646,11 +682,16 @@ final class IconView: NSView {
             m.addItem(ActionItem(kind == .separator ? "Remove Separator" : "Remove Spacer") { Store.shared.remove(u) })
             m.addItem(.separator())
             m.addItem(submenuItem("Q-Dock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
-            NSMenu.popUpContextMenu(m, with: e, for: self)
+            popUpMenu(m, with: e, in: self, edge: dotSide)
             return
         }
         m.addItem(NSMenuItem(title: displayName, action: nil, keyEquivalent: ""))
         m.addItem(.separator())
+        // The app's own Dock menu (windows, recent documents, "New Incognito Window", …), copied from the macOS Dock.
+        if kind != .trash && url.pathExtension == "app", let native = NativeDock.shared.appMenu(for: url), !native.items.isEmpty {
+            native.items.forEach { m.addItem($0.copy() as! NSMenuItem) }
+            m.addItem(.separator())
+        }
         if kind == .trash {
             m.addItem(ActionItem("Open") { NSWorkspace.shared.open(trashURL) })
             m.addItem(ActionItem("Empty Trash…", enabled: trashIsFull()) { emptyTrash() })
@@ -697,8 +738,22 @@ final class IconView: NSView {
         }
         m.addItem(.separator())
         m.addItem(submenuItem("Q-Dock", AppController.shared.dockMenu(screenID: dock?.dock?.screenID)))
-        NSMenu.popUpContextMenu(m, with: e, for: self)
+        popUpMenu(m, with: e, in: self, edge: dotSide)
     }
+}
+
+/// Opens a context menu with its corner at the pointer, growing away from the dock's edge so it doesn't cover the icons.
+func popUpMenu(_ m: NSMenu, with e: NSEvent, in view: NSView, edge: Edge) {
+    let p = view.convert(e.locationInWindow, from: nil)
+    let size = m.size
+    let up: CGFloat = view.isFlipped ? -1 : 1
+    var at = p
+    switch edge {
+    case .bottom, .free: at.y += up * size.height        // open upward from the pointer
+    case .right: at.x -= size.width                       // open to the left of the pointer
+    case .top, .left: break                               // open downward / to the right
+    }
+    m.popUp(positioning: nil, at: at, in: view)
 }
 
 /// Separator / spacer choices, inserted after `after` (or at the end).
@@ -835,6 +890,7 @@ final class DockView: NSView {
         trash = showTrash ? make(trashURL, .trash, trashImage(full: trashFull)) : nil
         computeLayout()
         refreshRunning(runningPaths)
+        refreshBadges(NativeDock.shared.badges)
         layoutIcons(icons, animated: false, except: nil)
         for (v, f) in zip(tail, tailFrames) { v.frame = f }
         needsDisplay = true
@@ -866,6 +922,10 @@ final class DockView: NSView {
         slotFrames = Array(frames[0..<pinnedCount])
         separatorFrame = hasSep ? frames[pinnedCount] : nil
         tailFrames = Array(frames[(pinnedCount + (hasSep ? 1 : 0))...])
+    }
+
+    func refreshBadges(_ badges: [String: String]) {
+        (icons + extras).forEach { $0.badge = badges[canonicalPath($0.url)] }
     }
 
     func refreshRunning(_ running: Set<String>) {
@@ -1052,7 +1112,7 @@ final class DockView: NSView {
 
     override func rightMouseDown(with e: NSEvent) {
         HoverLabel.shared.hide()
-        NSMenu.popUpContextMenu(AppController.shared.dockMenu(screenID: dock?.screenID), with: e, for: self)
+        popUpMenu(AppController.shared.dockMenu(screenID: dock?.screenID), with: e, in: self, edge: edge)
     }
 
     // Dropping files: onto Trash (move to Trash), a folder (move/copy in), an app (open with), or empty space (pin)
@@ -1824,6 +1884,8 @@ final class DesktopGuard {
 
 // MARK: - Dock window (one per screen)
 
+let kAboveDockLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
+
 final class DockPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -1886,7 +1948,9 @@ final class Dock {
     func refresh(animated: Bool) {
         let store = Store.shared
         let p = store.placement(for: screenID)
-        panel.level = store.alwaysOnTop(for: screenID) || store.dockMode(for: screenID) ? .floating : .normal
+        // Above the macOS Dock's own level, so Mission Control (which always shows the macOS Dock) can't cover it,
+        // and so it stays put instead of fading out and back in while switching Spaces.
+        panel.level = store.alwaysOnTop(for: screenID) || store.dockMode(for: screenID) ? kAboveDockLevel : .normal
         let vf = screen.visibleFrame
         view.configure(items: store.items, running: store.showRunning(for: screenID) ? AppController.shared.runningExtras() : [],
                        size: store.iconSize(for: screenID), spacing: store.spacing(for: screenID), locked: store.locked(for: screenID),
@@ -2013,6 +2077,135 @@ final class Dock {
     }
 }
 
+// MARK: - macOS Dock accessibility (badges and app menus)
+
+/// Reads the built-in Dock through Accessibility: each app's badge (AXStatusLabel) and its own Dock menu.
+/// The macOS Dock keeps its items and menus even while hidden, so this works with "Hide macOS Dock" on.
+/// Without Accessibility access it quietly does nothing.
+final class NativeDock {
+    static let shared = NativeDock()
+    private(set) var badges: [String: String] = [:]   // canonical app path → badge text
+    private var timer: Timer?
+
+    func start() {
+        guard timer == nil else { return }
+        poll()
+        let t = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in self?.poll() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private static func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
+    }
+    private static func children(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+    private static func role(_ e: AXUIElement) -> String? { attr(e, kAXRoleAttribute) as? String }
+
+    /// The Dock's application items, keyed by canonical bundle path.
+    private func appItems() -> [String: AXUIElement] {
+        guard AXIsProcessTrusted(),
+              let pid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+        else { return [:] }
+        let dock = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(dock, 0.5)
+        var out: [String: AXUIElement] = [:]
+        for list in Self.children(dock) where Self.role(list) == kAXListRole {
+            for item in Self.children(list) where (Self.attr(item, kAXSubroleAttribute) as? String) == "AXApplicationDockItem" {
+                if let url = Self.attr(item, kAXURLAttribute) as? URL { out[canonicalPath(url)] = item }
+            }
+        }
+        return out
+    }
+
+    private func poll() {
+        var b: [String: String] = [:]
+        for (path, item) in appItems() {
+            if let label = Self.attr(item, "AXStatusLabel") as? String, !label.isEmpty { b[path] = label }
+        }
+        guard b != badges else { return }
+        badges = b
+        AppController.shared.docks.values.forEach { $0.view.refreshBadges(b) }
+    }
+
+    // MARK: App menus
+
+    /// Opens the app's menu in the macOS Dock, reads it, and closes it again.
+    private func withOpenMenu<T>(_ url: URL, _ body: (AXUIElement) -> T?) -> T? {
+        guard let item = appItems()[canonicalPath(url)],
+              AXUIElementPerformAction(item, kAXShowMenuAction as CFString) == .success else { return nil }
+        var menu: AXUIElement?
+        for _ in 0..<25 {
+            menu = Self.children(item).first { Self.role($0) == kAXMenuRole }
+            if menu != nil { break }
+            usleep(8_000)
+        }
+        guard let menu else { return nil }
+        defer { AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
+        return body(menu)
+    }
+
+    /// Menu items: nil entries are separators.
+    private func sections(_ menu: AXUIElement) -> [[AXUIElement]] {
+        var out: [[AXUIElement]] = [[]]
+        for c in Self.children(menu) where Self.role(c) == kAXMenuItemRole {
+            let title = Self.attr(c, kAXTitleAttribute) as? String ?? ""
+            if title.isEmpty { out.append([]) } else { out[out.count - 1].append(c) }
+        }
+        return out.filter { !$0.isEmpty }
+    }
+
+    private func submenu(_ item: AXUIElement) -> AXUIElement? { Self.children(item).first { Self.role($0) == kAXMenuRole } }
+
+    /// Converts the Dock's menu to ours. Each item replays itself by title path, since the Dock's menu is
+    /// closed by the time you pick something. Q-Dock already offers the Dock's own last sections
+    /// (Options ▸ … / Show All Windows, Hide, Quit, or Open), so they're dropped; this keeps it locale-independent.
+    func appMenu(for url: URL) -> NSMenu? {
+        withOpenMenu(url) { menu in
+            var secs = sections(menu)
+            if !secs.isEmpty { secs.removeLast() }
+            if let last = secs.last, last.count == 1, submenu(last[0]) != nil { secs.removeLast() }
+            let m = NSMenu()
+            for (i, sec) in secs.enumerated() {
+                if i > 0 { m.addItem(.separator()) }
+                sec.forEach { m.addItem(convert($0, path: [], url: url)) }
+            }
+            return m
+        }
+    }
+
+    private func convert(_ e: AXUIElement, path: [String], url: URL) -> NSMenuItem {
+        let title = Self.attr(e, kAXTitleAttribute) as? String ?? ""
+        let full = path + [title]
+        let enabled = Self.attr(e, kAXEnabledAttribute) as? Bool ?? true
+        let mark = Self.attr(e, kAXMenuItemMarkCharAttribute) as? String ?? ""
+        if let sub = submenu(e) {
+            let m = NSMenu()
+            for (i, sec) in sections(sub).enumerated() {
+                if i > 0 { m.addItem(.separator()) }
+                sec.forEach { m.addItem(convert($0, path: full, url: url)) }
+            }
+            return submenuItem(title, m)
+        }
+        return ActionItem(title, checked: !mark.isEmpty, enabled: enabled) { [weak self] in self?.press(full, in: url) }
+    }
+
+    /// Re-opens the app's Dock menu and presses the item at `path`.
+    private func press(_ path: [String], in url: URL) {
+        _ = withOpenMenu(url) { menu -> Bool? in
+            var level = menu
+            for (i, title) in path.enumerated() {
+                guard let item = Self.children(level).first(where: { (Self.attr($0, kAXTitleAttribute) as? String) == title })
+                else { return nil }
+                if i == path.count - 1 { return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success }
+                guard let sub = submenu(item) else { return nil }
+                level = sub
+            }
+            return nil
+        }
+    }
+}
+
 // MARK: - Global hotkey (⌃⌥D toggles Auto-Hide on the screen under the pointer)
 
 func registerAutoHideHotKey() {
@@ -2086,9 +2279,15 @@ struct ReleaseInfo {
 
 struct UpdateError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    var signature = false   // the download is Q-Dock but isn't signed by a certificate this copy trusts
+    init(_ message: String, signature: Bool = false) { self.message = message; self.signature = signature }
     var errorDescription: String? { message }
 }
+
+/// Releases are signed with HQE Systems' Developer ID and notarized by Apple.
+let kTeamID = "JPKJW4C8V6"
+let kDeveloperIDRequirement = "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+    + " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"\(kTeamID)\""
 
 /// Compares dotted version strings numerically ("1.10.0" > "1.9.2").
 func compareVersions(_ a: String, _ b: String) -> ComparisonResult {
@@ -2261,8 +2460,8 @@ final class Updater {
         }.resume()
     }
 
-    /// The new app must be Q-Dock, the advertised version, and satisfy this app's own designated requirement
-    /// (same bundle ID and signing certificate). Ad-hoc builds can't be verified, so they never self-update.
+    /// The new app must be Q-Dock, the advertised version, and be signed either like this app (its designated
+    /// requirement) or with HQE Systems' Developer ID. Ad-hoc builds can't be verified, so they never self-update.
     static func verify(_ newApp: URL, version: String) throws {
         guard let b = Bundle(url: newApp), b.bundleIdentifier == Bundle.main.bundleIdentifier else {
             throw UpdateError("The download doesn't contain Q-Dock.")
@@ -2278,8 +2477,11 @@ final class Updater {
             throw UpdateError("Couldn't read the code signatures.")
         }
         let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate)
-        guard SecStaticCodeCheckValidity(candidate, flags, req) == errSecSuccess else {
-            throw UpdateError("The update isn't signed with Q-Dock's certificate, so it wasn't installed.")
+        var devID: SecRequirement?
+        SecRequirementCreateWithString(kDeveloperIDRequirement as CFString, [], &devID)
+        guard SecStaticCodeCheckValidity(candidate, flags, req) == errSecSuccess
+                || devID.map({ SecStaticCodeCheckValidity(candidate, flags, $0) == errSecSuccess }) == true else {
+            throw UpdateError("The update is signed with a different certificate than this copy of Q-Dock.", signature: true)
         }
     }
 
@@ -2292,6 +2494,9 @@ final class Updater {
             try? runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
             try? FileManager.default.removeItem(at: work)
             relaunch(app)
+        } catch let e as UpdateError where e.signature {
+            handOff(zip: work.appendingPathComponent("Q-Dock.zip"), info: info)
+            try? FileManager.default.removeItem(at: work)
         } catch {
             try? FileManager.default.removeItem(at: work)
             NSApp.activate(ignoringOtherApps: true)
@@ -2304,8 +2509,36 @@ final class Updater {
         }
     }
 
+    /// The update can't replace this copy automatically (it's signed differently, e.g. the first Developer ID build),
+    /// so put the download in Downloads and walk the person through installing it by hand.
+    private func handOff(zip: URL, info: ReleaseInfo) {
+        let fm = FileManager.default
+        let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask).first ?? fm.homeDirectoryForCurrentUser
+        let dest = uniqueDestination(in: downloads, for: "Q-Dock \(info.version).zip")
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        guard (try? fm.moveItem(at: zip, to: dest)) != nil else {
+            a.messageText = "Please install Q-Dock \(info.version) by hand"
+            a.informativeText = "This update is signed with a new certificate, so it can't replace this copy automatically. "
+                + "Download it from GitHub, open it, and it will replace this copy. Your settings are kept."
+            a.addButton(withTitle: "Open Download Page")
+            a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(info.pageURL) }
+            return
+        }
+        a.messageText = "Q-Dock \(info.version) is in your Downloads folder"
+        a.informativeText = "This update is signed with a new certificate, so it can't replace this copy automatically. To finish:\n\n"
+            + "1. Double-click “\(dest.lastPathComponent)” to unzip it.\n"
+            + "2. Open the new Q-Dock.\n"
+            + "3. Click “Move to Applications”. It replaces this copy and quits it.\n\n"
+            + "Your settings are kept. macOS may ask you to allow Accessibility again for Dock Mode, badges and app menus."
+        a.addButton(withTitle: "Show in Finder")
+        a.addButton(withTitle: "Later")
+        if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.activateFileViewerSelecting([dest]) }
+    }
+
     /// Waits for this process to exit, then reopens the (now updated) app.
-    private func relaunch(_ app: URL) {
+    func relaunch(_ app: URL) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$0\"", app.path]
@@ -2334,6 +2567,107 @@ final class Updater {
     private func hideProgress() {
         progress?.orderOut(nil)
         progress = nil
+    }
+}
+
+// MARK: - Move to Applications (one copy only)
+
+/// Keeps a single Q-Dock: quits older copies that are still running, and offers to move a freshly downloaded
+/// copy into Applications, replacing (trashing) the old one. Settings live in ~/Library/Preferences, so they stay.
+enum Installer {
+    private static let suppressKey = "neverOfferMove"
+
+    /// Where this copy really lives. Gatekeeper runs quarantined apps from a random read-only "translocation"
+    /// path; ask Security for the original (private API, looked up at runtime; nil if unavailable).
+    static var originalURL: URL {
+        let me = Bundle.main.bundleURL
+        typealias IsTranslocated = @convention(c) (CFURL, UnsafeMutablePointer<Bool>, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Bool
+        typealias OriginalPath = @convention(c) (CFURL, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFURL>?
+        guard let h = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+              let isSym = dlsym(h, "SecTranslocateIsTranslocatedURL"),
+              let origSym = dlsym(h, "SecTranslocateCreateOriginalPathForURL") else { return me }
+        var translocated = false
+        guard unsafeBitCast(isSym, to: IsTranslocated.self)(me as CFURL, &translocated, nil), translocated,
+              let orig = unsafeBitCast(origSym, to: OriginalPath.self)(me as CFURL, nil)?.takeRetainedValue() else { return me }
+        return orig as URL
+    }
+
+    static var isInApplications: Bool {
+        let parent = originalURL.deletingLastPathComponent().standardizedFileURL.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
+        return parent == "/Applications" || parent == home
+    }
+
+    /// Quits any other running copy of Q-Dock (e.g. the old one when you open a new download).
+    static func quitOtherCopies() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != me }
+        guard !others.isEmpty else { return }
+        others.forEach { $0.terminate() }
+        // Let them finish quitting (and restoring the macOS Dock, if set) before this copy sets things up.
+        let deadline = Date().addingTimeInterval(4)
+        while others.contains(where: { !$0.isTerminated }) && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+    }
+
+    /// When the signing certificate changes (e.g. the first Developer ID build), macOS keeps a stale
+    /// Accessibility entry for the old one that no longer applies. Clear it so the new grant is a clean one.
+    static func resetStalePermissionsIfSignerChanged() {
+        var me: SecCode?, st: SecStaticCode?, req: SecRequirement?, text: CFString?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyStaticCode(me, [], &st) == errSecSuccess, let st,
+              SecCodeCopyDesignatedRequirement(st, [], &req) == errSecSuccess, let req,
+              SecRequirementCopyString(req, [], &text) == errSecSuccess, let text else { return }
+        let d = UserDefaults.standard, current = text as String, key = "signingRequirement"
+        defer { d.set(current, forKey: key) }
+        // Copies from before 1.3 didn't record their signer; for them, any existing setup counts as a change.
+        let previous = d.string(forKey: key) ?? (d.bool(forKey: "onboarded") ? "" : current)
+        guard previous != current, !AXIsProcessTrusted(),
+              let id = Bundle.main.bundleIdentifier else { return }
+        _ = try? runTool("/usr/bin/tccutil", ["reset", "Accessibility", id])
+    }
+
+    static func offerMoveIfNeeded() {
+        guard !isInApplications, !UserDefaults.standard.bool(forKey: suppressKey) else { return }
+        let dest = URL(fileURLWithPath: "/Applications/Q-Dock.app")
+        let replacing = FileManager.default.fileExists(atPath: dest.path)
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Move Q-Dock to your Applications folder?"
+        a.informativeText = replacing
+            ? "Q-Dock is already in Applications. This copy will replace it (the old one goes to the Trash), so you only have one. Your settings are kept."
+            : "Q-Dock works best from Applications, and it can update itself there."
+        a.addButton(withTitle: "Move to Applications")
+        a.addButton(withTitle: "Not Now")
+        a.showsSuppressionButton = true
+        a.suppressionButton?.title = "Don't ask again"
+        let move = a.runModal() == .alertFirstButtonReturn
+        if a.suppressionButton?.state == .on { UserDefaults.standard.set(true, forKey: suppressKey) }
+        guard move else { return }
+        do {
+            try moveToApplications(dest)
+        } catch {
+            let e = NSAlert()
+            e.messageText = "Couldn't move Q-Dock"
+            e.informativeText = "\(error.localizedDescription)\n\nYou can drag Q-Dock into Applications yourself."
+            e.runModal()
+        }
+    }
+
+    private static func moveToApplications(_ dest: URL) throws {
+        let fm = FileManager.default
+        let source = originalURL
+        let staged = dest.deletingLastPathComponent().appendingPathComponent(".Q-Dock-\(UUID().uuidString).app")
+        try fm.copyItem(at: Bundle.main.bundleURL, to: staged)
+        if fm.fileExists(atPath: dest.path) {
+            do { try fm.trashItem(at: dest, resultingItemURL: nil) } catch { try? fm.removeItem(at: staged); throw error }
+        }
+        try fm.moveItem(at: staged, to: dest)
+        if source.standardizedFileURL != dest.standardizedFileURL { try? fm.trashItem(at: source, resultingItemURL: nil) }
+        Updater.shared.relaunch(dest)
     }
 }
 
@@ -2615,6 +2949,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var autoHideTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        Installer.quitOtherCopies()
+        Installer.resetStalePermissionsIfSignerChanged()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = statusItem.button {
             if let img = NSImage(systemSymbolName: "dock.rectangle", accessibilityDescription: "Q-Dock") {
@@ -2653,6 +2989,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         updateRunning()
         rebuild(animated: false)
         if store.hideSystemDock { SystemDock.hide() }
+        NativeDock.shared.start()
+        Installer.offerMoveIfNeeded()
         Onboarding.shared.showIfNeeded()
         if UserDefaults.standard.bool(forKey: "onboarded") && anyDockMode && !AXIsProcessTrusted() {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
