@@ -689,7 +689,9 @@ final class IconView: NSView {
         m.addItem(.separator())
         // The app's own Dock menu (windows, recent documents, "New Incognito Window", …), copied from the macOS Dock.
         if kind != .trash && url.pathExtension == "app", let native = NativeDock.shared.appMenu(for: url), !native.items.isEmpty {
-            native.items.forEach { m.addItem($0.copy() as! NSMenuItem) }
+            let items = native.items
+            native.removeAllItems()
+            items.forEach { m.addItem($0) }
             m.addItem(.separator())
         }
         if kind == .trash {
@@ -2112,7 +2114,12 @@ final class NativeDock {
         var out: [String: AXUIElement] = [:]
         for list in Self.children(dock) where Self.role(list) == kAXListRole {
             for item in Self.children(list) where (Self.attr(item, kAXSubroleAttribute) as? String) == "AXApplicationDockItem" {
-                if let url = Self.attr(item, kAXURLAttribute) as? URL { out[canonicalPath(url)] = item }
+                guard let url = Self.attr(item, kAXURLAttribute) as? URL else { continue }
+                // A running app can be listed twice (its pinned tile and its running tile); only the running one
+                // has the app's badge and full menu.
+                let key = canonicalPath(url)
+                let running = (Self.attr(item, "AXIsApplicationRunning") as? Bool) ?? false
+                if out[key] == nil || running { out[key] = item }
             }
         }
         return out
@@ -2130,22 +2137,24 @@ final class NativeDock {
 
     // MARK: App menus
 
-    /// Opens the app's menu in the macOS Dock, reads it, and closes it again.
+    /// Opens the app's menu in the macOS Dock, reads it, and closes it again. The Dock keeps the menu out of sight
+    /// while it's hidden; if the menu doesn't show up quickly, give up rather than stall the right-click.
     private func withOpenMenu<T>(_ url: URL, _ body: (AXUIElement) -> T?) -> T? {
-        guard let item = appItems()[canonicalPath(url)],
-              AXUIElementPerformAction(item, kAXShowMenuAction as CFString) == .success else { return nil }
+        guard let item = appItems()[canonicalPath(url)] else { return nil }
+        AXUIElementSetMessagingTimeout(item, 0.5)
+        guard AXUIElementPerformAction(item, kAXShowMenuAction as CFString) == .success else { return nil }
         var menu: AXUIElement?
-        for _ in 0..<25 {
+        let deadline = Date().addingTimeInterval(0.5)
+        while menu == nil && Date() < deadline {
             menu = Self.children(item).first { Self.role($0) == kAXMenuRole }
-            if menu != nil { break }
-            usleep(8_000)
+            if menu == nil { usleep(10_000) }
         }
         guard let menu else { return nil }
         defer { AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
         return body(menu)
     }
 
-    /// Menu items: nil entries are separators.
+    /// The menu's items, split into the groups between separators.
     private func sections(_ menu: AXUIElement) -> [[AXUIElement]] {
         var out: [[AXUIElement]] = [[]]
         for c in Self.children(menu) where Self.role(c) == kAXMenuItemRole {
@@ -2222,10 +2231,16 @@ func registerAutoHideHotKey() {
 // MARK: - macOS Dock (hide / restore)
 
 /// Hides the built-in Dock by auto-hiding it with a very long reveal delay, so it never appears.
-/// It can't be quit: its process also runs ⌘-Tab, Mission Control and Spaces.
+/// It can't be quit: its process also runs ⌘-Tab, Mission Control and Spaces. Mission Control always shows it,
+/// so it's also shrunk to its smallest size, which keeps it tucked behind Q-Dock there.
 enum SystemDock {
     private static let domain = "com.apple.dock"
     private static let savedKey = "systemDockSaved"
+    /// What Q-Dock changes while the Dock is hidden, and the values it sets.
+    private static let hiddenValues: [(key: String, type: String, value: String)] = [
+        ("autohide", "-bool", "true"), ("autohide-delay", "-float", "1000"),
+        ("tilesize", "-int", "16"), ("magnification", "-bool", "false"),
+    ]
 
     private static func run(_ path: String, _ args: [String]) {
         let p = Process()
@@ -2235,33 +2250,54 @@ enum SystemDock {
         p.waitUntilExit()
     }
     private static func read(_ key: String) -> Any? { CFPreferencesCopyAppValue(key as CFString, domain as CFString) }
+    private static func matches(_ key: String, _ value: String) -> Bool {
+        switch read(key) {
+        case let b as Bool where value == "true" || value == "false": return b == (value == "true")
+        case let n as NSNumber: return n.doubleValue == Double(value)
+        default: return false
+        }
+    }
 
     static var isHidden: Bool {
         (read("autohide") as? Bool ?? false) && ((read("autohide-delay") as? NSNumber)?.doubleValue ?? 0) >= 999
     }
 
+    private static let unset = "__unset__"
+
     static func hide() {
         let d = UserDefaults.standard
-        if d.dictionary(forKey: savedKey) == nil && !isHidden {
-            var saved: [String: Any] = ["autohide": read("autohide") as? Bool ?? false]
-            if let delay = read("autohide-delay") as? NSNumber { saved["delay"] = delay.doubleValue }
-            d.set(saved, forKey: savedKey)
+        var saved = d.dictionary(forKey: savedKey) ?? [:]
+        // Saves from before 1.3 hold only "autohide" and "delay" (absent when the Dock had no delay set).
+        if saved["autohide"] != nil && saved["autohide-delay"] == nil { saved["autohide-delay"] = saved["delay"] ?? unset }
+        saved["delay"] = nil
+        // Remember the person's own values the first time each one is changed.
+        for (key, _, _) in hiddenValues where saved[key] == nil {
+            if isHidden && (key == "autohide" || key == "autohide-delay") {
+                saved[key] = key == "autohide" ? false : unset   // hidden before Q-Dock knew: restore to the defaults
+            } else {
+                saved[key] = read(key) ?? unset
+            }
         }
-        guard !isHidden else { return }
-        run("/usr/bin/defaults", ["write", domain, "autohide", "-bool", "true"])
-        run("/usr/bin/defaults", ["write", domain, "autohide-delay", "-float", "1000"])
-        run("/usr/bin/killall", ["Dock"])
+        d.set(saved, forKey: savedKey)
+        var changed = false
+        for (key, type, value) in hiddenValues where !matches(key, value) {
+            run("/usr/bin/defaults", ["write", domain, key, type, value])
+            changed = true
+        }
+        if changed { run("/usr/bin/killall", ["Dock"]) }
     }
 
-    /// Puts back the auto-hide settings saved before Q-Dock hid the Dock.
+    /// Puts back the settings saved before Q-Dock hid the Dock.
     static func restore() {
         let d = UserDefaults.standard
-        let saved = d.dictionary(forKey: savedKey) ?? ["autohide": false]
-        run("/usr/bin/defaults", ["write", domain, "autohide", "-bool", (saved["autohide"] as? Bool ?? false) ? "true" : "false"])
-        if let delay = saved["delay"] as? Double {
-            run("/usr/bin/defaults", ["write", domain, "autohide-delay", "-float", String(delay)])
-        } else {
-            run("/usr/bin/defaults", ["delete", domain, "autohide-delay"])
+        let saved = d.dictionary(forKey: savedKey) ?? ["autohide": false, "autohide-delay": unset]
+        for (key, type, _) in hiddenValues {
+            switch saved[key] {
+            case nil: continue
+            case let b as Bool where type == "-bool": run("/usr/bin/defaults", ["write", domain, key, "-bool", b ? "true" : "false"])
+            case let n as NSNumber: run("/usr/bin/defaults", ["write", domain, key, type, type == "-int" ? String(n.intValue) : String(n.doubleValue)])
+            default: run("/usr/bin/defaults", ["delete", domain, key])
+            }
         }
         d.removeObject(forKey: savedKey)
         run("/usr/bin/killall", ["Dock"])
