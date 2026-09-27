@@ -76,6 +76,9 @@ final class Store {
     }
     var autoCheckUpdates: Bool { get { bool("autoCheckUpdates", true) } set { d.set(newValue, forKey: "autoCheckUpdates") } }
     var skippedVersion: String? { get { d.string(forKey: "skippedVersion") } set { d.set(newValue, forKey: "skippedVersion") } }
+    /// What clicking the app you're already in cycles through, besides its windows on this desktop.
+    var cycleOtherDesktops: Bool { get { bool("cycleOtherDesktops", true) } set { d.set(newValue, forKey: "cycleOtherDesktops") } }
+    var cycleMinimized: Bool { get { bool("cycleMinimized", false) } set { d.set(newValue, forKey: "cycleMinimized") } }
     var askedSystemDock: Bool { get { bool("askedSystemDock", false) } set { d.set(newValue, forKey: "askedSystemDock") } }
 
     private var placements: [String: Placement] {
@@ -2257,13 +2260,15 @@ final class NativeDock {
             out.append(wins.map { w in
                 let item = ActionItem(Self.windowTitle(w, app: app),
                                       checked: app.isActive && (Self.attr(w, kAXMainAttribute) as? Bool) == true) {
-                    if (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true {
-                        AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-                    }
-                    AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-                    app.activate()
+                    Self.focus(w, of: app)
                 }
-                if (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true { item.state = .mixed }
+                if Self.isMinimized(w) {
+                    let title = NSMutableAttributedString(string: item.title)
+                    title.append(NSAttributedString(string: "  Minimized", attributes: [
+                        .foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)]))
+                    item.attributedTitle = title
+                    item.image = NSImage(systemSymbolName: "dock.arrow.down.rectangle", accessibilityDescription: "Minimized")
+                }
                 return item
             })
         }
@@ -2312,8 +2317,7 @@ final class NativeDock {
         let listed = attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? []
         for w in listed + (scanned ?? scanWindows(app.processIdentifier)) where !out.contains(where: { CFEqual($0, w) }) {
             AXUIElementSetMessagingTimeout(w, 0.1)
-            guard (attr(w, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole,
-                  !((attr(w, kAXTitleAttribute) as? String) ?? "").isEmpty else { continue }
+            guard isAppWindow(w), !((attr(w, kAXTitleAttribute) as? String) ?? "").isEmpty else { continue }
             out.append(w)
         }
         return out
@@ -2333,42 +2337,82 @@ final class NativeDock {
             var v: AnyObject?
             let err = AXUIElementCopyAttributeValue(el, kAXSubroleAttribute as CFString, &v)
             if err == .cannotComplete { break }   // the app isn't responding; don't wait on every ID
-            if err == .success, (v as? String) == kAXStandardWindowSubrole { out.append(el) }
+            if err == .success, isAppWindow(el, subrole: v as? String) { out.append(el) }
         }
         return out
     }
 
-    /// Brings the app's backmost window on this desktop to the front, so repeated clicks go through all of them;
-    /// if every window is minimized, restores one. False when there's nothing to switch to.
+    /// Brings the app's next window forward, so repeated clicks go through all of them in a steady order: its
+    /// windows on this desktop, plus (per the settings) those on other desktops and minimized ones.
+    /// False when there's nothing else to switch to.
     func cycleWindows(_ app: NSRunningApplication) -> Bool {
         guard AXIsProcessTrusted() else { return false }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        let store = Store.shared
+        let pid = app.processIdentifier
+        let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.3)
-        let wins = (Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? [])
-            .filter { (Self.attr($0, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole }
-        let minimized = { (w: AXUIElement) in (Self.attr(w, kAXMinimizedAttribute) as? Bool) == true }
-        // Accessibility doesn't list windows in stacking order, so take it from the window server (front to back).
-        let order = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
-            .filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier && ($0[kCGWindowLayer as String] as? Int) == 0 }
+        var wins = Self.attr(axApp, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        if store.cycleOtherDesktops { wins += scanned[pid]?.windows ?? Self.scanWindows(pid) }
+        // The window server's on-screen list (this desktop), front to back.
+        let onScreen = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+            .filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid && ($0[kCGWindowLayer as String] as? Int) == 0 }
             .compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
-        let onScreen = wins.compactMap { w -> (AXUIElement, Int)? in
-            var id: CGWindowID = 0
-            guard !minimized(w), _AXUIElementGetWindow(w, &id) == .success, let z = order.firstIndex(of: id) else { return nil }
-            return (w, z)
-        }.sorted { $0.1 < $1.1 }.map(\.0)
-        let target: AXUIElement
-        if onScreen.count >= 2 {
-            target = onScreen.last!
-        } else if onScreen.isEmpty, let w = wins.first(where: minimized) {
-            AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-            target = w
-        } else {
-            return false
-        }
-        AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
-        app.activate()
+        var seen = Set<CGWindowID>()
+        let candidates = wins.compactMap { w -> (id: CGWindowID, w: AXUIElement)? in
+            guard Self.isAppWindow(w), let id = Self.windowID(w), seen.insert(id).inserted else { return nil }
+            if Self.isMinimized(w) { return store.cycleMinimized ? (id, w) : nil }
+            return onScreen.contains(id) || store.cycleOtherDesktops ? (id, w) : nil
+        }.sorted { $0.id < $1.id }   // creation order, so the cycle is steady
+        guard !candidates.isEmpty else { return false }
+        let current = onScreen.first.flatMap { front in candidates.firstIndex { $0.id == front } }
+        if candidates.count == 1 && current != nil { return false }   // already on its only window
+        let target = candidates[current.map { ($0 + 1) % candidates.count } ?? 0].w
+        Self.focus(target, of: app)
+        prefetchWindows(app)
         return true
+    }
+
+    private static func windowID(_ w: AXUIElement) -> CGWindowID? {
+        var id: CGWindowID = 0
+        return _AXUIElementGetWindow(w, &id) == .success && id != 0 ? id : nil
+    }
+    private static func isMinimized(_ w: AXUIElement) -> Bool { (attr(w, kAXMinimizedAttribute) as? Bool) == true }
+
+    /// A document window: a standard window, or a minimized one (which reports itself as a dialog while in the Dock).
+    private static func isAppWindow(_ w: AXUIElement, subrole: String? = nil) -> Bool {
+        let sub = subrole ?? attr(w, kAXSubroleAttribute) as? String
+        return sub == kAXStandardWindowSubrole || (sub == kAXDialogSubrole && isMinimized(w))
+    }
+
+    private typealias SetFrontProcess = @convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, CGWindowID, UInt32) -> CGError
+    private typealias PostEventRecord = @convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, UnsafeMutablePointer<UInt8>) -> CGError
+    private static let skyLight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
+
+    /// Brings one window to the front and makes it key, the way clicking it would, restoring it if it's minimized.
+    /// If it's on another desktop, macOS switches there. Uses the window server calls window switchers rely on
+    /// (looked up at runtime); falls back to activating the app.
+    static func focus(_ w: AXUIElement, of app: NSRunningApplication) {
+        if isMinimized(w) { AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
+        var psn = ProcessSerialNumber()
+        if let id = windowID(w), let sl = skyLight,
+           let setFront = dlsym(sl, "_SLPSSetFrontProcessWithOptions"), let post = dlsym(sl, "SLPSPostEventRecordTo"),
+           qdGetProcessForPID(app.processIdentifier, &psn) == noErr {
+            _ = unsafeBitCast(setFront, to: SetFrontProcess.self)(&psn, id, 0x200)   // user-generated
+            // Make the window key: two synthetic window-server events (the same bytes window switchers send).
+            var bytes = [UInt8](repeating: 0, count: 0xf8)
+            bytes[0x04] = 0xf8
+            bytes[0x3a] = 0x10
+            withUnsafeBytes(of: id) { bytes.replaceSubrange(0x3c..<0x40, with: $0) }
+            for i in 0x20..<0x30 { bytes[i] = 0xff }
+            bytes[0x08] = 0x01
+            _ = unsafeBitCast(post, to: PostEventRecord.self)(&psn, &bytes)
+            bytes[0x08] = 0x02
+            _ = unsafeBitCast(post, to: PostEventRecord.self)(&psn, &bytes)
+        } else {
+            app.activate()
+        }
+        AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(w, kAXRaiseAction as CFString)
     }
 
     /// Refreshes the app's window list in the background, so a right-click that follows is instant.
@@ -2469,6 +2513,10 @@ final class NativeDock {
         }
     }
 }
+
+/// The process serial number for a pid (deprecated Carbon call, unavailable to Swift by name).
+@_silgen_name("GetProcessForPID")
+func qdGetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
 
 /// Private HIServices call that gives a window element's window-server ID.
 @_silgen_name("_AXUIElementGetWindow")
@@ -3522,6 +3570,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         })
         m.addItem(ActionItem("Bring Back macOS Dock When Q-Dock Quits", checked: store.restoreSystemDockOnQuit,
                              enabled: store.hideSystemDock) { [weak self] in self?.store.restoreSystemDockOnQuit.toggle() })
+        let cycle = NSMenu()
+        cycle.addItem(ActionItem("Windows on This Desktop", checked: true, enabled: false) {})
+        cycle.addItem(ActionItem("Windows on Other Desktops", checked: store.cycleOtherDesktops) { [weak self] in
+            self?.store.cycleOtherDesktops.toggle()
+        })
+        cycle.addItem(ActionItem("Minimized Windows", checked: store.cycleMinimized) { [weak self] in self?.store.cycleMinimized.toggle() })
+        m.addItem(submenuItem("Clicking an Open App Cycles Through", cycle))
         m.addItem(ActionItem("Show on All Screens", checked: store.allScreens) { [weak self] in self?.store.allScreens.toggle() })
         m.addItem(ActionItem("Same Position on Every Screen", checked: store.syncPositions) { [weak self] in self?.store.syncPositions.toggle() })
         m.addItem(ActionItem("Launch at Login", checked: SMAppService.mainApp.status == .enabled) { self.toggleLoginItem() })
