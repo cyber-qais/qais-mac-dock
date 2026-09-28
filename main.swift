@@ -2154,6 +2154,8 @@ final class NativeDock {
     }
 
     private func poll() {
+        // Reading the Dock while the Apps (Spotlight) panel is open closes the panel, so wait until it's gone.
+        if spotlightIsOpen() { return }
         var b: [String: String] = [:]
         for (path, item) in appItems() {
             if let label = Self.attr(item, "AXStatusLabel") as? String, !label.isEmpty { b[path] = label }
@@ -2161,6 +2163,11 @@ final class NativeDock {
         guard b != badges else { return }
         badges = b
         AppController.shared.docks.values.forEach { $0.view.refreshBadges(b) }
+    }
+
+    private func spotlightIsOpen() -> Bool {
+        let wins = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return wins.contains { ($0[kCGWindowOwnerName as String] as? String) == "Spotlight" && ($0[kCGWindowLayer as String] as? Int ?? 0) > 0 }
     }
 
     // MARK: App menus
