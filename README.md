@@ -45,11 +45,11 @@ If you use more than one monitor, the macOS Dock probably gets in your way.
 | 🫥 **Auto-Hide** | Per screen. The dock slides off its edge and comes back when you push the pointer against that edge. Toggle it with **⌃⌥D**. |
 | 🪟 **Dock Mode** | Keeps other windows out from behind an edge-pinned dock by nudging or resizing them. |
 | 🔴 **Badges & app menus** | Unread counts and other badges show on each icon. Right-clicking an app lists its open windows (on every desktop) and its own Dock commands (*New Incognito Window*, profiles, recent files, …); Q-Dock learns an app's commands while your screen is locked or asleep. Needs Accessibility. |
-| 🔁 **Window cycling** | Click the app you're already in to bring its next window forward, including windows on other desktops. Minimized windows can be included too, and if an app's only window is minimized, a click restores it (or opens a new window, if you prefer). See menu → *Clicking an Open App*. |
+| 🔁 **Window cycling** | Click the app you're already in (or scroll over its icon) to bring its next window forward, including windows on other desktops. Minimized windows can be included too, and if an app's only window is minimized, a click restores it (or opens a new window, if you prefer). See menu → *Clicking an Open App*. |
 | 🏷️ **Instant labels** | App names appear the moment you hover, with a small genie-style magnification. |
 | 📂 **Folder stacks** | Open folders as a **Fan** or **Grid**, with previews. Drag files out, drop files in, and right-click to copy, rename or trash. |
-| ⚙️ **Running apps** | Open apps that aren't pinned show up after a separator. Drag one in to pin it. |
-| 🗑️ **Trash** | Shows empty or full. Drop files on it to trash them, or drop a dock icon on it to remove it. |
+| ⚙️ **Running apps** | Open apps that aren't pinned show up after a separator. The frontmost app gets an accent-colored dot. Drag one in to pin it. |
+| 🗑️ **Trash** | Shows empty or full (no extra permissions needed), and hovering shows how many items are in it. Drop files on it to trash them, or drop a dock icon on it to remove it. |
 | 🎨 **Folder icons** | Give each docked folder its own color, a symbol (⭐️, 📷, </>, …) or any image or app icon. |
 | ➗ **Separators & spacers** | Group your apps with separators, spacers and small spacers, placed anywhere. |
 | ⬆️ **One-click updates** | Q-Dock tells you when a new version is out and can update and restart itself. |
@@ -70,7 +70,7 @@ Runs on macOS 14 or later, on both Apple Silicon and Intel Macs.
 
 ### Build from source
 
-Requires macOS 14 or later and Xcode (or the Xcode Command Line Tools).
+Requires macOS 14 or later and the Xcode Command Line Tools (`xcode-select --install`); full Xcode is not needed.
 
 ```bash
 git clone https://github.com/cyber-qais/qais-mac-dock.git
@@ -88,7 +88,8 @@ The Q-Dock icon in the menu bar opens settings at any time.
 
 ```bash
 git pull && ./build.sh
-pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applications/ && open ~/Applications/Q-Dock.app
+pkill -x Q-Dock; while pgrep -x Q-Dock >/dev/null; do sleep 0.2; done
+rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applications/ && open ~/Applications/Q-Dock.app
 ```
 
 > [!NOTE]
@@ -131,6 +132,8 @@ pkill -x Q-Dock; rm -rf ~/Applications/Q-Dock.app && cp -R Q-Dock.app ~/Applicat
 | Pin a running app | Drag it from the running section into the pinned area, or right-click → **Keep in Dock** |
 | Open a file with a specific app | Drop the file onto that app's icon |
 | Quit an app | Right-click → **Quit**, or **Force Quit** (no ⌥ needed) |
+| Show an item in Finder | ⌘-click it |
+| Switch to an app and hide all others | ⌥-click it |
 
 ### Folders: Fan and Grid
 
@@ -281,7 +284,7 @@ pkill -x Q-Dock; defaults delete com.local.qdock; open ~/Applications/Q-Dock.app
 | Permission | Used for | Where to allow it |
 |---|---|---|
 | Accessibility | Dock Mode (moving other windows), badges, and apps' own right-click menus | System Settings → Privacy & Security → Accessibility |
-| Full Disk Access | The Trash full/empty icon; opening protected folders as stacks | System Settings → Privacy & Security → Full Disk Access |
+| Full Disk Access | Opening protected folders (Desktop, Documents, Downloads) as stacks; an exact Trash item count. The Trash full/empty icon works without it. | System Settings → Privacy & Security → Full Disk Access |
 | Automation (Finder) | Keeping desktop icons clear in Dock Mode; **Empty Trash…** | macOS asks the first time it's needed |
 
 The setup assistant opens on first launch, and you can reopen it anytime from **Setup Assistant…** in the menu.

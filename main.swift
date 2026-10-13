@@ -195,6 +195,7 @@ final class Store {
     }
     func folderStyle(for u: URL) -> FolderStyle { folderStyles[u.path] ?? FolderStyle() }
     func setFolderStyle(_ s: FolderStyle, for u: URL) {
+        IconView.forgetIcon(u)
         var m = folderStyles
         m[u.path] = s.isDefault ? nil : s
         folderStyles = m
@@ -222,7 +223,21 @@ extension NSScreen {
     }
 }
 
-func canonicalPath(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
+private var canonicalCache: [String: String] = [:]
+private let canonicalLock = NSLock()
+/// Resolves symlinks once per path; this runs for every running app on each launch/quit, dock rebuild and badge poll.
+func canonicalPath(_ url: URL) -> String {
+    let key = url.path
+    canonicalLock.lock()
+    let cached = canonicalCache[key]
+    canonicalLock.unlock()
+    if let cached { return cached }
+    let c = url.resolvingSymlinksInPath().standardizedFileURL.path
+    canonicalLock.lock()
+    canonicalCache[key] = c
+    canonicalLock.unlock()
+    return c
+}
 
 /// How an item is stored: a file path, or a qdock:// URL for separators and spacers.
 func itemKey(_ u: URL) -> String { u.isFileURL ? u.path : u.absoluteString }
@@ -298,9 +313,46 @@ func displayName(_ url: URL) -> String {
 let trashURL = FileManager.default.urls(for: .trashDirectory, in: .userDomainMask).first
     ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
 
-func trashIsFull() -> Bool {
-    let items = (try? FileManager.default.contentsOfDirectory(atPath: trashURL.path)) ?? []
-    return items.contains { $0 != ".DS_Store" && $0 != ".localized" }
+/// What's in the Trash. `~/.Trash` and each volume's `.Trashes/<uid>` are privacy-protected: without Full Disk
+/// Access they can't be listed, but they can still be stat'ed, and on APFS a directory's link count is its entry
+/// count plus two. Finder's own `.DS_Store` / `.localized` files are stat'ed individually and left out.
+struct TrashState: Equatable {
+    var count = 0
+    var exact = true
+    var full: Bool { count > 0 }
+    var label: String { count == 0 ? "Trash" : "Trash — \(count) item\(count == 1 ? "" : "s")" }
+}
+
+func fileExists(_ path: String) -> Bool {
+    var st = stat()
+    return stat(path, &st) == 0
+}
+
+/// Entry count of one trash folder, or nil if it doesn't exist.
+private func trashEntries(_ dir: URL) -> (count: Int, exact: Bool)? {
+    if let items = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
+        return (items.filter { $0 != ".DS_Store" && $0 != ".localized" }.count, true)
+    }
+    var st = stat()
+    guard stat(dir.path, &st) == 0 else { return nil }
+    var n = Int(st.st_nlink) - 2
+    for hidden in [".DS_Store", ".localized"] where fileExists(dir.appendingPathComponent(hidden).path) { n -= 1 }
+    return (max(0, n), false)
+}
+
+/// Safe to call off the main thread.
+func readTrashState() -> TrashState {
+    var dirs = [trashURL]
+    let uid = getuid()
+    let vols = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: [.skipHiddenVolumes]) ?? []
+    for v in vols where v.path != "/" { dirs.append(v.appendingPathComponent(".Trashes/\(uid)")) }
+    var state = TrashState()
+    for d in dirs {
+        guard let e = trashEntries(d) else { continue }
+        state.count += e.count
+        state.exact = state.exact && e.exact
+    }
+    return state
 }
 
 func trashImage(full: Bool) -> NSImage {
@@ -317,6 +369,9 @@ func emptyTrash() {
     guard a.runModal() == .alertFirstButtonReturn else { return }
     var err: NSDictionary?
     NSAppleScript(source: "tell application \"Finder\" to empty trash")?.executeAndReturnError(&err)
+    for delay in [0.5, 2.0, 5.0] {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { AppController.shared.updateTrash() }
+    }
 }
 
 /// A transform that scales by (sx, sy) around point `p` (in the layer's bounds), then offsets by (dx, dy).
@@ -425,9 +480,32 @@ final class IconView: NSView {
     private let badgeLayer = CALayer()
     private(set) var magnification: CGFloat = 1
     var running = false { didSet { if running != oldValue { needsDisplay = true } } }
+    var active = false { didSet { if active != oldValue { needsDisplay = true } } }
     /// The app's Dock badge ("3", "•", …), read from the macOS Dock.
     var badge: String? { didSet { if badge != oldValue { updateBadge() } } }
     var dimmed = false { didSet { alphaValue = dimmed ? 0.3 : 1 } }
+
+    /// Icons and folder checks are cached across rebuilds: every app launch or quit rebuilds every dock, and
+    /// fetching an icon (or rendering a styled folder) for each item each time was most of that work.
+    private static var iconCache: [String: NSImage] = [:]
+    private static var folderCache: [String: Bool] = [:]
+    static func forgetIcon(_ url: URL) { iconCache[url.path] = nil }
+
+    private static func isPlainFolder(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        if let c = folderCache[url.path] { return c }
+        let rv = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        let f = (rv?.isDirectory ?? false) && !(rv?.isPackage ?? false)
+        folderCache[url.path] = f
+        return f
+    }
+
+    private static func icon(for url: URL, folder: Bool) -> NSImage {
+        if let c = iconCache[url.path] { return c }
+        let img = (folder ? styledFolderIcon(url) : nil) ?? NSWorkspace.shared.icon(forFile: url.path)
+        iconCache[url.path] = img
+        return img
+    }
 
     init(url: URL, kind: Kind = .item, image: NSImage? = nil, size: CGFloat, dotSide: Edge) {
         self.url = url
@@ -435,10 +513,8 @@ final class IconView: NSView {
         self.s = size
         self.dotSide = dotSide
         let decoration = kind == .separator || kind == .spacer || kind == .smallSpacer
-        self.image = image ?? (decoration ? NSImage() : NSWorkspace.shared.icon(forFile: url.path))
-        let rv = url.isFileURL ? try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) : nil
-        isFolder = kind == .item && (rv?.isDirectory ?? false) && !(rv?.isPackage ?? false)
-        if isFolder, image == nil, let styled = styledFolderIcon(url) { self.image = styled }
+        isFolder = kind == .item && Self.isPlainFolder(url)
+        self.image = image ?? (decoration ? NSImage() : Self.icon(for: url, folder: isFolder))
         super.init(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
         wantsLayer = true
         clipsToBounds = false
@@ -452,7 +528,7 @@ final class IconView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    var displayName: String { kind == .trash ? "Trash" : QDock.displayName(url) }
+    var displayName: String { kind == .trash ? AppController.shared.trashState.label : QDock.displayName(url) }
     var isDecoration: Bool { kind == .separator || kind == .spacer || kind == .smallSpacer }
     /// Length along the dock's main axis.
     var mainLength: CGFloat { kind == .separator ? kSep : kind == .smallSpacer ? s / 2 : s }
@@ -600,14 +676,28 @@ final class IconView: NSView {
             return
         }
         if running {
-            NSColor.labelColor.withAlphaComponent(0.8).setFill()
-            let c = dotCenter
-            NSBezierPath(ovalIn: NSRect(x: c.x - 2, y: c.y - 2, width: 4, height: 4)).fill()
+            // The frontmost app gets an accent-colored, slightly larger dot.
+            let c = dotCenter, r: CGFloat = active ? 2.6 : 2
+            (active ? NSColor.controlAccentColor : NSColor.labelColor.withAlphaComponent(0.8)).setFill()
+            NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)).fill()
         }
     }
 
     func open(event: NSEvent? = nil) {
         if isDecoration { return }
+        let mods = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+        if mods.contains(.command) && kind != .trash {
+            // ⌘-click: show in Finder, as in the macOS Dock.
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            return
+        }
+        if mods.contains(.option), let app = runningApp {
+            // ⌥-click: switch to the app and hide everything else.
+            app.activate()
+            for other in NSWorkspace.shared.runningApplications
+            where other.activationPolicy == .regular && other != app && other.processIdentifier != getpid() { other.hide() }
+            return
+        }
         if kind == .trash {
             NSWorkspace.shared.open(trashURL)
         } else if isFolder && Store.shared.stackStyle(for: url) != .folder {
@@ -617,6 +707,26 @@ final class IconView: NSView {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         } else {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    private var scrollAccum: CGFloat = 0
+    private var lastScrollCycle = Date.distantPast
+
+    /// Scrolling over a running app steps through its windows, one per notch (or ~a finger-flick on a trackpad).
+    override func scrollWheel(with e: NSEvent) {
+        guard kind == .running || url.pathExtension == "app", let app = runningApp else { super.scrollWheel(with: e); return }
+        if e.phase == .began { scrollAccum = 0 }
+        if e.momentumPhase != [] { return }   // ignore trackpad momentum, or one flick cycles several windows
+        scrollAccum += e.scrollingDeltaY != 0 ? e.scrollingDeltaY : e.scrollingDeltaX
+        guard abs(scrollAccum) >= (e.hasPreciseScrollingDeltas ? 24 : 1),
+              Date().timeIntervalSince(lastScrollCycle) > 0.2 else { return }
+        scrollAccum = 0
+        lastScrollCycle = Date()
+        if app.isActive || NSWorkspace.shared.frontmostApplication == app {
+            _ = NativeDock.shared.cycleWindows(app)
+        } else {
+            app.activate()
         }
     }
 
@@ -708,7 +818,7 @@ final class IconView: NSView {
         }
         if kind == .trash {
             m.addItem(ActionItem("Open") { NSWorkspace.shared.open(trashURL) })
-            m.addItem(ActionItem("Empty Trash…", enabled: trashIsFull()) { emptyTrash() })
+            m.addItem(ActionItem("Empty Trash…", enabled: AppController.shared.trashState.full) { emptyTrash() })
         } else if kind == .running {
             let u = url
             m.addItem(ActionItem("Keep in Dock") { Store.shared.add([u]) })
@@ -910,6 +1020,7 @@ final class DockView: NSView {
         trash = showTrash ? make(trashURL, .trash, trashImage(full: trashFull)) : nil
         computeLayout()
         refreshRunning(runningPaths)
+        refreshActive(AppController.shared.activePath)
         refreshBadges(NativeDock.shared.badges)
         layoutIcons(icons, animated: false, except: nil)
         for (v, f) in zip(tail, tailFrames) { v.frame = f }
@@ -951,6 +1062,12 @@ final class DockView: NSView {
     func refreshRunning(_ running: Set<String>) {
         icons.forEach { $0.running = running.contains(canonicalPath($0.url)) }
         extras.forEach { $0.running = true }
+    }
+
+    func refreshActive(_ path: String?) {
+        for v in icons + extras where v.kind == .item || v.kind == .running {
+            v.active = path != nil && canonicalPath(v.url) == path
+        }
     }
 
     private func layoutIcons(_ order: [IconView], animated: Bool, except: IconView?) {
@@ -1692,6 +1809,14 @@ final class StackController: NSObject, NSWindowDelegate {
 final class DockMode {
     static let shared = DockMode()
     private var timer: Timer?
+    private let queue = DispatchQueue(label: "qdock.dockmode", qos: .userInitiated)
+    private var inFlight = false
+
+    /// A newly activated app may have windows under the dock; check it right away rather than on the next tick.
+    func appActivated() {
+        guard timer != nil else { return }
+        tick(allApps: false)
+    }
 
     func update() {
         guard AppController.shared.docks.values.contains(where: { Store.shared.dockMode(for: $0.screenID) }) else {
@@ -1720,18 +1845,25 @@ final class DockMode {
         }
     }
 
+    /// Accessibility calls are IPC round-trips to other apps, so they run on a background queue; the dock's own
+    /// state (strips, screens, running apps) is captured on the main thread first.
     private func tick(allApps: Bool) {
-        guard AXIsProcessTrusted(), NSEvent.pressedMouseButtons == 0 else { return }
+        guard !inFlight, AXIsProcessTrusted(), NSEvent.pressedMouseButtons == 0 else { return }
         let strips = reserved()
-        guard !strips.isEmpty else { return }
-        let apps = allApps ? NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
-                           : [NSWorkspace.shared.frontmostApplication].compactMap { $0 }
-        for app in apps where app.processIdentifier != getpid() {
-            let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            var val: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &val) == .success,
-                  let wins = val as? [AXUIElement] else { continue }
-            for w in wins { adjust(w, strips) }
+        guard !strips.isEmpty, let primary = NSScreen.screens.first?.frame else { return }
+        let pids = (allApps ? NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+                            : [NSWorkspace.shared.frontmostApplication].compactMap { $0 })
+            .map(\.processIdentifier).filter { $0 != getpid() }
+        inFlight = true
+        queue.async { [self] in
+            for pid in pids {
+                let axApp = AXUIElementCreateApplication(pid)
+                var val: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &val) == .success,
+                      let wins = val as? [AXUIElement] else { continue }
+                for w in wins { adjust(w, strips, primary: primary) }
+            }
+            DispatchQueue.main.async { self.inFlight = false }
         }
     }
 
@@ -1743,7 +1875,7 @@ final class DockMode {
         return AXValueGetValue(v as! AXValue, type, &out) ? out : nil
     }
 
-    private func adjust(_ w: AXUIElement, _ strips: [(Edge, NSRect)]) {
+    private func adjust(_ w: AXUIElement, _ strips: [(Edge, NSRect)], primary: NSRect) {
         var v: CFTypeRef?
         AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &v)
         guard (v as? String) == (kAXStandardWindowSubrole as String) else { return }
@@ -1754,8 +1886,7 @@ final class DockMode {
         AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute as CFString, &v)
         if (v as? Bool) == true { return }
         guard let pos = value(w, kAXPositionAttribute, .cgPoint, CGPoint.zero),
-              let size = value(w, kAXSizeAttribute, .cgSize, CGSize.zero),
-              let primary = NSScreen.screens.first?.frame else { return }
+              let size = value(w, kAXSizeAttribute, .cgSize, CGSize.zero) else { return }
 
         let original = NSRect(x: pos.x, y: primary.height - pos.y - size.height, width: size.width, height: size.height)
         var f = original
@@ -1795,8 +1926,11 @@ final class DesktopGuard {
     private var timer: Timer?
     private var busy = false
     private(set) var automationDenied = false
+    private var lastStamp: String?
+    private var lastRun = Date.distantPast
 
     func update() {
+        lastStamp = nil
         let on = AppController.shared.anyDockMode && !automationDenied
         if on && timer == nil {
             timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
@@ -1825,6 +1959,16 @@ final class DesktopGuard {
         return (String(decoding: o, as: UTF8.self), p.terminationStatus, String(decoding: e, as: UTF8.self))
     }
 
+    /// Cheap change detector: the Desktop folder's modification time (files added/removed) plus its `.DS_Store`
+    /// (icon positions). Nil when they can't be read, which means "always run".
+    private func desktopStamp() -> String? {
+        let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
+        var a = stat(), b = stat()
+        guard stat(desktop.path, &a) == 0 else { return nil }
+        let ds = stat(desktop.appendingPathComponent(".DS_Store").path, &b) == 0 ? "\(b.st_mtimespec.tv_sec).\(b.st_mtimespec.tv_nsec)" : "-"
+        return "\(a.st_mtimespec.tv_sec).\(a.st_mtimespec.tv_nsec)/\(a.st_nlink)/\(ds)"
+    }
+
     private func tick() {
         guard !busy, NSEvent.pressedMouseButtons == 0,
               NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.apple.finder" }),
@@ -1834,6 +1978,12 @@ final class DesktopGuard {
             (e, NSRect(x: r.minX, y: primary.height - r.maxY, width: r.width, height: r.height))
         }
         guard !strips.isEmpty else { return }
+        // Asking Finder for every desktop icon spawns osascript and round-trips to Finder, so only do it when the
+        // desktop or the docks changed (with a slow safety net, since Finder writes .DS_Store lazily).
+        let stamp = desktopStamp().map { $0 + " " + strips.map { "\($0.0)\($0.1)" }.joined() }
+        if let stamp, stamp == lastStamp, Date().timeIntervalSince(lastRun) < 30 { return }
+        lastStamp = stamp
+        lastRun = Date()
         busy = true
         DispatchQueue.global(qos: .utility).async {
             let read = """
@@ -1984,7 +2134,7 @@ final class Dock {
         let vf = screen.visibleFrame
         view.configure(items: store.items, running: store.showRunning(for: screenID) ? AppController.shared.runningExtras() : [],
                        size: store.iconSize(for: screenID), spacing: store.spacing(for: screenID), locked: store.locked(for: screenID),
-                       showTrash: store.showTrash(for: screenID), trashFull: AppController.shared.trashFull,
+                       showTrash: store.showTrash(for: screenID), trashFull: AppController.shared.trashState.full,
                        vertical: p.isVertical, edge: p.edge,
                        maxLength: (p.isVertical ? vf.height : vf.width) - 2 * kMargin,
                        runningPaths: AppController.shared.running)
@@ -2116,6 +2266,8 @@ final class NativeDock {
     static let shared = NativeDock()
     private(set) var badges: [String: String] = [:]   // canonical app path → badge text
     private var timer: Timer?
+    private let queue = DispatchQueue(label: "qdock.nativedock", qos: .utility)
+    private var polling = false
 
     func start() {
         guard timer == nil else { return }
@@ -2153,16 +2305,24 @@ final class NativeDock {
         return out
     }
 
+    /// Walking the Dock's accessibility tree is dozens of IPC calls, so it runs on a background queue and only
+    /// the result is applied on the main thread.
     private func poll() {
         // Reading the Dock while the Apps (Spotlight) panel is open closes the panel, so wait until it's gone.
-        if spotlightIsOpen() { return }
-        var b: [String: String] = [:]
-        for (path, item) in appItems() {
-            if let label = Self.attr(item, "AXStatusLabel") as? String, !label.isEmpty { b[path] = label }
+        if polling || spotlightIsOpen() { return }
+        polling = true
+        queue.async { [self] in
+            var b: [String: String] = [:]
+            for (path, item) in appItems() {
+                if let label = Self.attr(item, "AXStatusLabel") as? String, !label.isEmpty { b[path] = label }
+            }
+            DispatchQueue.main.async {
+                self.polling = false
+                guard b != self.badges else { return }
+                self.badges = b
+                AppController.shared.docks.values.forEach { $0.view.refreshBadges(b) }
+            }
         }
-        guard b != badges else { return }
-        badges = b
-        AppController.shared.docks.values.forEach { $0.view.refreshBadges(b) }
     }
 
     private func spotlightIsOpen() -> Bool {
@@ -3126,22 +3286,28 @@ final class Onboarding {
     }
 }
 
+/// Holds the assistant's state as an observable object rather than `@State`, which on current SDKs is a macro
+/// that only ships with Xcode (the Command Line Tools can't expand it).
+final class OnboardingState: ObservableObject {
+    @Published var step = 0
+    @Published var axGranted = AXIsProcessTrusted()
+    @Published var fdaGranted = hasFullDiskAccess()
+    @Published var loginItem = SMAppService.mainApp.status == .enabled
+    @Published var imported = false
+    @Published var hideDock = Store.shared.hideSystemDock
+    @Published var restoreOnQuit = Store.shared.restoreSystemDockOnQuit
+}
+
 struct OnboardingView: View {
     let finish: () -> Void
-    @State private var step = 0
-    @State private var axGranted = AXIsProcessTrusted()
-    @State private var fdaGranted = hasFullDiskAccess()
-    @State private var loginItem = SMAppService.mainApp.status == .enabled
-    @State private var imported = false
+    @StateObject private var st = OnboardingState()
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-    @State private var hideDock = Store.shared.hideSystemDock
-    @State private var restoreOnQuit = Store.shared.restoreSystemDockOnQuit
     private let steps = 4
 
     var body: some View {
         VStack(spacing: 0) {
             Group {
-                switch step {
+                switch st.step {
                 case 0: welcome
                 case 1: permissions
                 case 2: systemDock
@@ -3155,13 +3321,13 @@ struct OnboardingView: View {
             HStack {
                 HStack(spacing: 6) {
                     ForEach(0..<steps, id: \.self) { i in
-                        Circle().fill(i == step ? Color.accentColor : Color.secondary.opacity(0.3)).frame(width: 7, height: 7)
+                        Circle().fill(i == st.step ? Color.accentColor : Color.secondary.opacity(0.3)).frame(width: 7, height: 7)
                     }
                 }
                 Spacer()
-                if step > 0 { Button("Back") { step -= 1 } }
-                Button(step == steps - 1 ? "Get Started" : "Continue") {
-                    if step == steps - 1 { finish() } else { step += 1 }
+                if st.step > 0 { Button("Back") { st.step -= 1 } }
+                Button(st.step == steps - 1 ? "Get Started" : "Continue") {
+                    if st.step == steps - 1 { finish() } else { st.step += 1 }
                 }
                 .keyboardShortcut(.defaultAction)
             }
@@ -3169,9 +3335,9 @@ struct OnboardingView: View {
         }
         .frame(width: 580, height: 500)
         .onReceive(tick) { _ in
-            axGranted = AXIsProcessTrusted()
-            fdaGranted = hasFullDiskAccess()
-            loginItem = SMAppService.mainApp.status == .enabled
+            st.axGranted = AXIsProcessTrusted()
+            st.fdaGranted = hasFullDiskAccess()
+            st.loginItem = SMAppService.mainApp.status == .enabled
         }
     }
 
@@ -3188,13 +3354,13 @@ struct OnboardingView: View {
             Spacer().frame(height: 8)
             Button {
                 importSystemDock()
-                imported = true
+                st.imported = true
             } label: {
-                Label(imported ? "Imported your macOS Dock items" : "Import my macOS Dock items",
-                      systemImage: imported ? "checkmark.circle.fill" : "square.and.arrow.down")
+                Label(st.imported ? "Imported your macOS Dock items" : "Import my macOS Dock items",
+                      systemImage: st.imported ? "checkmark.circle.fill" : "square.and.arrow.down")
             }
             .controlSize(.large)
-            .disabled(imported)
+            .disabled(st.imported)
             Text("Optional — replaces Q-Dock's items with the apps and folders in your macOS Dock.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -3207,13 +3373,13 @@ struct OnboardingView: View {
             Text("Q-Dock works without these, but a few features need them.").foregroundStyle(.secondary)
             PermissionRow(icon: "macwindow.on.rectangle", title: "Accessibility",
                           detail: "Needed for Dock Mode, which moves other windows out from behind the dock.",
-                          granted: axGranted, buttonTitle: "Grant Access") {
+                          granted: st.axGranted, buttonTitle: "Grant Access") {
                 _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
                 openPrivacyPane("Privacy_Accessibility")
             }
             PermissionRow(icon: "externaldrive", title: "Full Disk Access",
-                          detail: "Lets the Trash icon show when it's full, and lets folder stacks open protected folders. In Settings, click +, then choose Q-Dock from Applications.",
-                          granted: fdaGranted, buttonTitle: "Open Settings") {
+                          detail: "Lets folder stacks open protected folders such as Desktop, Documents and Downloads, and gives the Trash an exact item count. In Settings, click +, then choose Q-Dock from Applications.",
+                          granted: st.fdaGranted, buttonTitle: "Open Settings") {
                 openPrivacyPane("Privacy_AllFiles")
             }
             HStack(alignment: .top, spacing: 14) {
@@ -3223,9 +3389,9 @@ struct OnboardingView: View {
                     Text("Start Q-Dock automatically when you log in.").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Toggle("", isOn: Binding(get: { loginItem }, set: { _ in
+                Toggle("", isOn: Binding(get: { st.loginItem }, set: { _ in
                     AppController.shared.toggleLoginItem()
-                    loginItem = SMAppService.mainApp.status == .enabled
+                    st.loginItem = SMAppService.mainApp.status == .enabled
                 }))
                 .toggleStyle(.switch)
                 .labelsHidden()
@@ -3240,20 +3406,20 @@ struct OnboardingView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 14) {
-                ChoiceCard(icon: "eye.slash", title: "Hide the macOS Dock", detail: "Use Q-Dock instead", selected: hideDock) {
-                    hideDock = true
+                ChoiceCard(icon: "eye.slash", title: "Hide the macOS Dock", detail: "Use Q-Dock instead", selected: st.hideDock) {
+                    st.hideDock = true
                     AppController.shared.setHideSystemDock(true)
                 }
-                ChoiceCard(icon: "eye", title: "Keep the macOS Dock", detail: "Use both docks", selected: !hideDock) {
-                    hideDock = false
+                ChoiceCard(icon: "eye", title: "Keep the macOS Dock", detail: "Use both docks", selected: !st.hideDock) {
+                    st.hideDock = false
                     AppController.shared.setHideSystemDock(false)
                 }
             }
-            Toggle("Bring the macOS Dock back when Q-Dock quits", isOn: Binding(get: { restoreOnQuit }, set: {
-                restoreOnQuit = $0
+            Toggle("Bring the macOS Dock back when Q-Dock quits", isOn: Binding(get: { st.restoreOnQuit }, set: {
+                st.restoreOnQuit = $0
                 Store.shared.restoreSystemDockOnQuit = $0
             }))
-            .disabled(!hideDock)
+            .disabled(!st.hideDock)
         }
         .onAppear { Store.shared.askedSystemDock = true }
     }
@@ -3339,8 +3505,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     var docks: [String: Dock] = [:]
     var statusItem: NSStatusItem!
     var running: Set<String> = []
-    var trashFull = false
+    var activePath: String?
+    var trashState = TrashState()
     var menuDepth = 0
+    private var trashPollBusy = false
     private var autoHideTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -3364,13 +3532,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         let wc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
-            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] n in
                 guard let self else { return }
+                if let u = (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleURL { IconView.forgetIcon(u) }
                 self.updateRunning()
                 if self.docks.values.contains(where: { self.store.showRunning(for: $0.screenID) }) { self.rebuild(animated: true) }
             }
         }
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.updateTrash() }
+        wc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self else { return }
+            let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self.activePath = app?.bundleURL.map(canonicalPath)
+            self.docks.values.forEach { $0.view.refreshActive(self.activePath) }
+            DockMode.shared.appActivated()
+        }
+        // A few stat() calls per second; the folders themselves can't be watched without Full Disk Access.
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.updateTrash() }
         nc.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
             self?.menuDepth += 1
         }
@@ -3380,7 +3557,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         registerAutoHideHotKey()
         Updater.shared.start()
-        trashFull = trashIsFull()
+        trashState = readTrashState()
+        activePath = NSWorkspace.shared.frontmostApplication?.bundleURL.map(canonicalPath)
         updateRunning()
         rebuild(animated: false)
         if store.hideSystemDock { SystemDock.hide() }
@@ -3449,10 +3627,20 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     func updateTrash() {
-        let full = trashIsFull()
-        guard full != trashFull else { return }
-        trashFull = full
-        docks.values.forEach { $0.view.trash?.setImage(trashImage(full: full)) }
+        guard !trashPollBusy else { return }
+        trashPollBusy = true
+        DispatchQueue.global(qos: .utility).async {
+            let state = readTrashState()
+            DispatchQueue.main.async {
+                self.trashPollBusy = false
+                guard state != self.trashState else { return }
+                let wasFull = self.trashState.full
+                self.trashState = state
+                if state.full != wasFull {
+                    self.docks.values.forEach { $0.view.trash?.setImage(trashImage(full: state.full)) }
+                }
+            }
+        }
     }
 
     func rebuild(animated: Bool) {
