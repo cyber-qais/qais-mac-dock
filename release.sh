@@ -42,5 +42,6 @@ spctl --assess --type execute --verbose=2 "$APP"
 
 rm -f Q-Dock.zip
 ditto -c -k --keepParent "$APP" Q-Dock.zip
+tools/verify-release.sh Q-Dock.zip
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
 echo "Ready: $(pwd)/Q-Dock.zip (Q-Dock $VERSION, notarized). Attach it to the v$VERSION GitHub release."

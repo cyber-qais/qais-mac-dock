@@ -299,6 +299,8 @@ main.swift               the whole app (AppKit + a SwiftUI setup assistant)
 build.sh                 compiles, generates the icon, and bundles Q-Dock.app
 tools/make-icon.swift    turns assets/icon.png into AppIcon.icns
 tools/make-signing-cert.sh  creates the local signing certificate build.sh uses
+release.sh               builds a Developer ID signed, notarized Q-Dock.zip for GitHub Releases
+tools/verify-release.sh  checks a release zip (local or on GitHub) would open without Gatekeeper warnings
 assets/icon.png          app icon source
 docs/screenshots/        images used in this README
 ```
@@ -313,4 +315,15 @@ updater downloads that asset). The one-time setup is described at the top of the
 
 ```bash
 ./release.sh
+gh release upload v<version> Q-Dock.zip --clobber
+tools/verify-release.sh v<version>   # checks the zip that's actually on GitHub
 ```
+
+> [!WARNING]
+> **Never publish a `build.sh` build.** `build.sh` signs with the self-signed *Q-Dock Local Signing* certificate
+> (or ad-hoc), which only your own Mac trusts. Everywhere else macOS blocks it as "could not be verified", as
+> happened with the first upload of 1.3.1. `tools/verify-release.sh` fails any zip that isn't Developer ID signed,
+> notarized, stapled and accepted by Gatekeeper; `release.sh` runs it on every zip it makes.
+>
+> Every release since 1.3.0 is Developer ID signed. Keep it that way: 1.3.0 and later only auto-update to builds
+> signed like themselves or with the Developer ID, so a self-signed release would break their in-app updater.

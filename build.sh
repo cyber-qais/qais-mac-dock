@@ -55,5 +55,7 @@ else
     codesign --force --sign - "$APP"
     echo "Signed ad-hoc (run tools/make-signing-cert.sh to keep permissions across rebuilds)"
   fi
+  # Only this Mac trusts this signature; anywhere else macOS blocks the app as "could not be verified".
+  echo "Local build only: don't publish it. Releases come from ./release.sh."
 fi
 echo "Built $(pwd)/$APP"
